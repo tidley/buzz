@@ -14,6 +14,7 @@ use buzz_pubsub::PubSubManager;
 use buzz_search::SearchService;
 
 use buzz_relay::config::Config;
+use buzz_relay::discovery;
 use buzz_relay::metrics as relay_metrics;
 use buzz_relay::router::{build_health_router, build_router};
 use buzz_relay::state::AppState;
@@ -123,6 +124,11 @@ async fn main() -> anyhow::Result<()> {
         error!("Invalid configuration: {e}");
         anyhow::anyhow!("Configuration error: {e}")
     })?;
+    let discovery_identity = config
+        .discovery
+        .as_ref()
+        .map(|discovery| discovery::load_or_create_identity(&discovery.identity_path))
+        .transpose()?;
     info!(
         bind_addr = %config.bind_addr,
         relay_url = %config.relay_url,
@@ -132,6 +138,11 @@ async fn main() -> anyhow::Result<()> {
         audit_enabled = config.audit_enabled,
         "Config loaded"
     );
+
+    if let (Some(discovery), Some(identity)) = (config.discovery.clone(), discovery_identity) {
+        let relay_url = config.relay_url.clone();
+        tokio::spawn(async move { discovery::publish(discovery, identity, relay_url).await });
+    }
 
     let usage_interval_secs = usage_metrics_interval_secs();
     let usage_idle_timeout_secs = usage_metrics_idle_timeout_secs(usage_interval_secs);

@@ -17,6 +17,8 @@ pub mod config;
 pub mod conformance;
 /// WebSocket connection lifecycle and state.
 pub mod connection;
+/// Public NIP-66 relay discovery identity and announcement.
+pub mod discovery;
 /// Relay error types.
 pub mod error;
 /// WebSocket message handlers for NIP-01 client commands.

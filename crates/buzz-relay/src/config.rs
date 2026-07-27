@@ -46,6 +46,15 @@ pub struct JoinPolicyConfig {
     pub version: String,
 }
 
+/// Opt-in publication of a signed NIP-66 relay discovery event.
+#[derive(Debug, Clone)]
+pub struct DiscoveryConfig {
+    /// Explicit path that stores the persistent discovery signing key.
+    pub identity_path: std::path::PathBuf,
+    /// Public relays that receive the discovery event.
+    pub relays: Vec<String>,
+}
+
 /// Relay runtime configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -90,6 +99,8 @@ pub struct Config {
     /// Optional hex-encoded private key for the relay's signing keypair.
     /// If absent, a fresh keypair is generated at startup.
     pub relay_private_key: Option<String>,
+    /// Optional public Nostr discovery configuration.
+    pub discovery: Option<DiscoveryConfig>,
     /// Optional Unix Domain Socket path. When set, the relay also listens on this
     /// UDS for traffic (e.g. service mesh sidecar). Health probes still use TCP.
     pub uds_path: Option<String>,
@@ -376,6 +387,64 @@ fn parse_bool(name: &str, default: bool) -> Result<bool, ConfigError> {
     }
 }
 
+const DEFAULT_DISCOVERY_RELAYS: [&str; 3] =
+    ["wss://relay.damus.io", "wss://nos.lol", "wss://nostr.mom"];
+
+fn discovery_config_from_env() -> Result<Option<DiscoveryConfig>, ConfigError> {
+    if !parse_bool("BUZZ_DISCOVERY_ENABLED", false)? {
+        return Ok(None);
+    }
+
+    let identity_path = std::env::var("BUZZ_DISCOVERY_IDENTITY_PATH")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            ConfigError::InvalidValue(
+                "BUZZ_DISCOVERY_IDENTITY_PATH is required when BUZZ_DISCOVERY_ENABLED=true"
+                    .to_string(),
+            )
+        })?;
+
+    let raw_relays = std::env::var("BUZZ_DISCOVERY_RELAYS")
+        .unwrap_or_else(|_| DEFAULT_DISCOVERY_RELAYS.join(","));
+    let mut relays = Vec::new();
+    for raw in raw_relays.split(',') {
+        let url = url::Url::parse(raw.trim()).map_err(|error| {
+            ConfigError::InvalidValue(format!(
+                "BUZZ_DISCOVERY_RELAYS contains an invalid relay URL: {error}"
+            ))
+        })?;
+        if !matches!(url.scheme(), "ws" | "wss")
+            || url.host().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_DISCOVERY_RELAYS entries must be ws:// or wss:// URLs without credentials, query, or fragment"
+                    .to_string(),
+            ));
+        }
+        let normalized = url.to_string();
+        if !relays.contains(&normalized) {
+            relays.push(normalized);
+        }
+    }
+    if relays.is_empty() {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_DISCOVERY_RELAYS must contain at least one relay URL".to_string(),
+        ));
+    }
+
+    Ok(Some(DiscoveryConfig {
+        identity_path,
+        relays,
+    }))
+}
+
 fn parse_optional_bool(name: &str) -> Result<bool, ConfigError> {
     parse_bool(name, false)
 }
@@ -600,6 +669,7 @@ impl Config {
             .collect();
 
         let relay_private_key = std::env::var("BUZZ_RELAY_PRIVATE_KEY").ok();
+        let discovery = discovery_config_from_env()?;
 
         let uds_path = std::env::var("BUZZ_UDS_PATH")
             .ok()
@@ -886,6 +956,7 @@ impl Config {
             require_auth_token,
             cors_origins,
             relay_private_key,
+            discovery,
             uds_path,
             health_port,
             metrics_port,
@@ -982,6 +1053,52 @@ mod tests {
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
         );
+    }
+
+    #[test]
+    fn discovery_uses_public_defaults_and_requires_an_identity_path() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous_enabled = std::env::var_os("BUZZ_DISCOVERY_ENABLED");
+        let previous_path = std::env::var_os("BUZZ_DISCOVERY_IDENTITY_PATH");
+        let previous_relays = std::env::var_os("BUZZ_DISCOVERY_RELAYS");
+
+        std::env::set_var("BUZZ_DISCOVERY_ENABLED", "true");
+        std::env::set_var(
+            "BUZZ_DISCOVERY_IDENTITY_PATH",
+            "/tmp/buzz-discovery-test.key",
+        );
+        std::env::remove_var("BUZZ_DISCOVERY_RELAYS");
+        let config = discovery_config_from_env()
+            .expect("discovery config")
+            .expect("enabled");
+
+        std::env::remove_var("BUZZ_DISCOVERY_IDENTITY_PATH");
+        let missing_path = discovery_config_from_env();
+
+        for (name, previous) in [
+            ("BUZZ_DISCOVERY_ENABLED", previous_enabled),
+            ("BUZZ_DISCOVERY_IDENTITY_PATH", previous_path),
+            ("BUZZ_DISCOVERY_RELAYS", previous_relays),
+        ] {
+            if let Some(value) = previous {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+
+        assert_eq!(
+            config.relays,
+            vec![
+                "wss://relay.damus.io/",
+                "wss://nos.lol/",
+                "wss://nostr.mom/",
+            ]
+        );
+        assert!(matches!(
+            missing_path,
+            Err(ConfigError::InvalidValue(message)) if message.contains("BUZZ_DISCOVERY_IDENTITY_PATH")
+        ));
     }
 
     #[test]
