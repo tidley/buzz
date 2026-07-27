@@ -81,6 +81,43 @@ a local upload keystore must set `BUZZ_ANDROID_RELEASE_SIGNING=external`. That
 mode produces an unsigned release bundle and refuses to run if any
 `BUZZ_ANDROID_UPLOAD_*` value is also set.
 
+## Optional FIPS bridge
+
+`crates/buzz-fips-mobile` is the Buzz-owned Android `cdylib` boundary for a
+Flutter FFI integration. It owns one `FipsMobileQuicSession`, and exposes
+start, connect, send, receive, stop, and status. It does not change the relay
+transport unless a community both enables its FIPS preference and uses a FIPS
+peer URL. It is not included in normal Android builds.
+
+The dependency is pinned to `https://github.com/tidley/fips.git` revision
+`3f58f1c`. The bridge creates an in-memory identity at `start`; it does not
+write identity material. `connect` accepts a UTF-8 Nostr `npub` and establishes
+the persistent QUIC stream through FIPS Nostr/STUN discovery. `send` and
+`receive` exchange length-delimited application frames on that stream.
+
+On Android builds that include the library, a preferred community with a relay
+URL that includes `fipsPeer=<peer-npub>` uses `FipsRelayTransport`. The Dart bridge loads
+`libbuzz_fips_mobile.so`, maps bridge status codes to connection and stream
+errors, and receives frames on a worker isolate so it does not block the UI.
+The transport is selected only on Android. If the preference is disabled, the
+URL has no FIPS peer, or the optional library is absent, Buzz uses
+the normal WebSocket transport instead.
+
+All operations return a `BridgeStatus` code. `receive(frame, capacity, out_len)`
+writes the required frame length to `out_len`; if it returns `BufferTooSmall`,
+the frame remains pending and the caller can retry with a larger buffer.
+`submit_frame` remains an ABI alias for `send`.
+
+Set the Gradle project property `buzzFipsMobile` for an Android build. The task
+writes ABI-specific `.so` files to `app/src/main/jniLibs/`. It needs Android
+NDK and `cargo-ndk`, and remains opt-in so normal Flutter and Rust checks do
+not need either tool.
+
+```bash
+cd mobile/android
+./gradlew -PbuzzFipsMobile assembleDebug
+```
+
 ## Architecture
 
 ```

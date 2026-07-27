@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -8,6 +9,7 @@ import 'package:http/testing.dart' as http_testing;
 import 'package:nostr/nostr.dart' as nostr;
 import 'package:pointycastle/digests/sha256.dart';
 import 'package:buzz/shared/auth/auth_provider.dart';
+import 'package:buzz/shared/community/community.dart';
 import 'package:buzz/shared/relay/relay.dart';
 
 void main() {
@@ -202,6 +204,7 @@ void main() {
             required onMessage,
             required onConnected,
             required onDisconnected,
+            required transportFactory,
           }) {
             final socket = _ControlledRelaySocket(
               wsUrl: wsUrl,
@@ -243,6 +246,126 @@ void main() {
 
     sockets.last.connectSuccessfully();
     expect(session.state.status, SessionStatus.connected);
+  });
+
+  test('selects the configured NIP-17 transport factory', () async {
+    RelayTransportMode? selectedMode;
+    final keychain = nostr.Keys.generate();
+    final session = RelaySessionNotifier(
+      socketFactory:
+          ({
+            required wsUrl,
+            required nsec,
+            required onMessage,
+            required onConnected,
+            required onDisconnected,
+            required transportFactory,
+          }) => _ControlledRelaySocket(
+            wsUrl: wsUrl,
+            nsec: nsec,
+            onMessage: onMessage,
+            onConnected: onConnected,
+            onDisconnected: onDisconnected,
+          ),
+      transportFactorySelector: (config) {
+        selectedMode = config.relayTransport;
+        return (_) => throw UnimplementedError();
+      },
+    );
+    final config = _FakeRelayConfigNotifier(
+      baseUrl: 'https://private.example',
+      nsec: keychain.nsec,
+      relayTransport: RelayTransportMode.nip17,
+      nip17GatewayPubkey: nostr.Keys.generate().public,
+      nip17PublicRelayUrls: const ['wss://public.example'],
+    );
+    final container = ProviderContainer(
+      overrides: [
+        relaySessionProvider.overrideWith(() => session),
+        relayConfigProvider.overrideWith(() => config),
+        authProvider.overrideWith(() => _AuthenticatedAuthNotifier()),
+      ],
+    );
+    addTearDown(container.dispose);
+    await container.read(authProvider.future);
+    final subscription = container.listen(relaySessionProvider, (_, _) {});
+    addTearDown(subscription.close);
+
+    await Future<void>.delayed(Duration.zero);
+
+    expect(selectedMode, RelayTransportMode.nip17);
+  });
+
+  test('passes configured gateway values to the NIP-17 transport factory', () {
+    const gatewayPubkey =
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    String? selectedNsec;
+    String? selectedGatewayPubkey;
+    List<Uri>? selectedPublicRelays;
+    final config = RelayConfig(
+      baseUrl: 'https://private.example',
+      nsec: 'nsec-placeholder',
+      relayTransport: RelayTransportMode.nip17,
+      nip17GatewayPubkey: gatewayPubkey,
+      nip17PublicRelayUrls: const ['wss://public.example'],
+    );
+
+    relayTransportFactoryFor(
+      config,
+      nip17TransportFactory: (nsec, gateway, publicRelays) {
+        selectedNsec = nsec;
+        selectedGatewayPubkey = gateway;
+        selectedPublicRelays = publicRelays;
+        return (_) => throw UnimplementedError();
+      },
+    );
+
+    expect(selectedNsec, 'nsec-placeholder');
+    expect(selectedGatewayPubkey, gatewayPubkey);
+    expect(selectedPublicRelays, [Uri.parse('wss://public.example')]);
+  });
+
+  test('keeps direct connections on the WebSocket transport factory', () {
+    final config = const RelayConfig(baseUrl: 'https://relay.example');
+
+    relayTransportFactoryFor(
+      config,
+      nip17TransportFactory: (_, _, _) {
+        fail('direct configuration must not construct a NIP-17 transport');
+      },
+    );
+  });
+
+  test('selects FIPS for an Android FIPS peer when preferred', () {
+    final config = const RelayConfig(
+      baseUrl: 'https://relay.example?fipsPeer=npub1relaypeer',
+      preferFips: true,
+    );
+
+    final factory = relayTransportFactoryFor(
+      config,
+      fipsBridgeFactory: _FakeFipsBridge.new,
+      isAndroid: () => true,
+    );
+    final transport = factory(Uri.parse(config.wsUrl));
+    addTearDown(transport.close);
+
+    expect(transport, isA<FipsRelayTransport>());
+  });
+
+  test('falls back to WebSocket when FIPS is unavailable', () {
+    final config = const RelayConfig(
+      baseUrl: 'https://relay.example?fipsPeer=npub1relaypeer',
+      preferFips: true,
+    );
+
+    final factory = relayTransportFactoryFor(
+      config,
+      fipsBridgeFactory: _FakeFipsBridge.new,
+      isAndroid: () => false,
+    );
+
+    expect(factory, same(WebSocketRelayTransport.connect));
   });
 
   test('does not schedule reconnects after background disconnect', () {
@@ -393,18 +516,53 @@ class _ControlledRelaySocket extends RelaySocket {
   void disconnectWith(Object? error) => _disconnected(error);
 }
 
+class _FakeFipsBridge implements FipsBridge {
+  @override
+  FipsBridgeStatus connect(String peer) => FipsBridgeStatus.connected;
+
+  @override
+  Future<FipsReceiveResult> receive(int capacity) async =>
+      const FipsReceiveResult.status(FipsBridgeStatus.failed);
+
+  @override
+  FipsBridgeStatus send(Uint8List frame) => FipsBridgeStatus.connected;
+
+  @override
+  FipsBridgeStatus start() => FipsBridgeStatus.running;
+
+  @override
+  FipsBridgeStatus stop() => FipsBridgeStatus.stopped;
+}
+
 const _channelId = '11111111-1111-4111-8111-111111111111';
 
 class _FakeRelayConfigNotifier extends RelayConfigNotifier {
   final String _baseUrl;
   final String? _nsec;
+  final RelayTransportMode _relayTransport;
+  final String? _nip17GatewayPubkey;
+  final List<String> _nip17PublicRelayUrls;
 
-  _FakeRelayConfigNotifier({required String baseUrl, required String? nsec})
-    : _baseUrl = baseUrl,
-      _nsec = nsec;
+  _FakeRelayConfigNotifier({
+    required String baseUrl,
+    required String? nsec,
+    RelayTransportMode relayTransport = RelayTransportMode.direct,
+    String? nip17GatewayPubkey,
+    List<String> nip17PublicRelayUrls = const [],
+  }) : _baseUrl = baseUrl,
+       _nsec = nsec,
+       _relayTransport = relayTransport,
+       _nip17GatewayPubkey = nip17GatewayPubkey,
+       _nip17PublicRelayUrls = nip17PublicRelayUrls;
 
   @override
-  RelayConfig build() => RelayConfig(baseUrl: _baseUrl, nsec: _nsec);
+  RelayConfig build() => RelayConfig(
+    baseUrl: _baseUrl,
+    nsec: _nsec,
+    relayTransport: _relayTransport,
+    nip17GatewayPubkey: _nip17GatewayPubkey,
+    nip17PublicRelayUrls: _nip17PublicRelayUrls,
+  );
 }
 
 NostrEvent _event() {

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Bytes;
-use axum::extract::ws::{Message as WsMessage, Utf8Bytes as WsUtf8Bytes};
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
@@ -33,6 +32,7 @@ use crate::audio::AudioRoomManager;
 use crate::config::Config;
 use crate::connection::ConnectionSubscriptions;
 use crate::subscription::SubscriptionRegistry;
+use crate::transport::RelayFrame;
 
 pub(crate) type ScopedPubkeyKey = (CommunityId, [u8; 32]);
 type SlidingWindowCounter = (u32, Instant);
@@ -40,11 +40,11 @@ type ScopedRateLimiter = DashMap<ScopedPubkeyKey, SlidingWindowCounter>;
 
 /// Per-connection entry in the connection manager.
 struct ConnEntry {
-    tx: mpsc::Sender<WsMessage>,
+    tx: mpsc::Sender<RelayFrame>,
     /// Control-frame sender, drained ahead of data and before cancel wins in
     /// the send loop. Used to deliver a ban-disconnect frame that must reach
     /// the client before the socket is closed (see [`ConnectionManager::disconnect_pubkey`]).
-    ctrl_tx: mpsc::Sender<WsMessage>,
+    ctrl_tx: mpsc::Sender<RelayFrame>,
     cancel: CancellationToken,
     /// Community resolved from the connection host at handshake. This is the
     /// receiver-side tenant label fan-out must compare against the event label.
@@ -205,8 +205,8 @@ impl ConnectionManager {
     pub fn register(
         &self,
         conn_id: Uuid,
-        tx: mpsc::Sender<WsMessage>,
-        ctrl_tx: mpsc::Sender<WsMessage>,
+        tx: mpsc::Sender<RelayFrame>,
+        ctrl_tx: mpsc::Sender<RelayFrame>,
         cancel: CancellationToken,
         community_id: CommunityId,
         backpressure_count: Arc<AtomicU8>,
@@ -323,9 +323,7 @@ impl ConnectionManager {
                 }
                 // Best-effort delivery: a full control buffer still gets the
                 // close via cancel below, just without the reason frame.
-                let _ = entry
-                    .ctrl_tx
-                    .try_send(WsMessage::Text(frame.clone().into()));
+                let _ = entry.ctrl_tx.try_send(RelayFrame::Text(frame.clone()));
                 entry.cancel.cancel();
                 closed += 1;
             }
@@ -364,12 +362,12 @@ impl ConnectionManager {
         closed
     }
 
-    /// The WS close frame announcing a graceful restart: 1012 Service Restart.
-    fn restart_close_frame() -> WsMessage {
-        WsMessage::Close(Some(axum::extract::ws::CloseFrame {
-            code: axum::extract::ws::close_code::RESTART,
-            reason: axum::extract::ws::Utf8Bytes::from_static("relay restarting"),
-        }))
+    /// The close frame announcing a graceful restart: 1012 Service Restart.
+    fn restart_close_frame() -> RelayFrame {
+        RelayFrame::Close {
+            code: 1012,
+            reason: "relay restarting".to_string(),
+        }
     }
 
     /// Return the server-resolved community that the connection's host bound to.
@@ -434,20 +432,21 @@ impl ConnectionManager {
     /// On sustained backpressure (>grace_limit consecutive full buffers),
     /// cancels the connection. Transient stalls get a warning only.
     pub fn send_to(&self, conn_id: Uuid, msg: String) -> bool {
-        self.try_send_ws_message(conn_id, WsMessage::Text(msg.into()))
+        self.try_send_frame(conn_id, RelayFrame::Text(msg))
     }
 
     /// Sends an already-serialized UTF-8 text payload to the given connection.
     ///
-    /// The shared `Bytes` payload is cloned into the outbound WS message without
-    /// copying the frame body. Callers must only pass valid UTF-8 bytes.
+    /// The shared bytes are serialized JSON and converted into a text transport frame.
     pub fn send_to_text_bytes(&self, conn_id: Uuid, msg: Arc<Bytes>) -> bool {
-        let text = WsUtf8Bytes::try_from(Bytes::clone(msg.as_ref()))
-            .expect("relay fan-out frames are serialized UTF-8 JSON");
-        self.try_send_ws_message(conn_id, WsMessage::Text(text))
+        let Ok(text) = std::str::from_utf8(msg.as_ref()) else {
+            tracing::error!(conn_id = %conn_id, "fan-out payload was not valid UTF-8");
+            return false;
+        };
+        self.try_send_frame(conn_id, RelayFrame::Text(text.to_owned()))
     }
 
-    fn try_send_ws_message(&self, conn_id: Uuid, msg: WsMessage) -> bool {
+    fn try_send_frame(&self, conn_id: Uuid, msg: RelayFrame) -> bool {
         if let Some(entry) = self.connections.get(&conn_id) {
             let conn = entry.value();
             match conn.tx.try_send(msg) {
@@ -1216,7 +1215,7 @@ impl std::fmt::Debug for AppState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::connection::{AuthState, ConnectionState};
     use std::collections::HashMap;
@@ -1230,8 +1229,8 @@ mod tests {
     ) -> (
         ConnectionManager,
         Uuid,
-        mpsc::Receiver<WsMessage>,
-        mpsc::Receiver<WsMessage>,
+        mpsc::Receiver<RelayFrame>,
+        mpsc::Receiver<RelayFrame>,
         CancellationToken,
         Arc<AtomicU8>,
     ) {
@@ -1254,7 +1253,7 @@ mod tests {
         (mgr, conn_id, rx, ctrl_rx, cancel, bp)
     }
 
-    async fn test_state() -> Arc<AppState> {
+    pub(crate) async fn test_state() -> Arc<AppState> {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -1719,9 +1718,9 @@ mod tests {
         // The reason frame is queued on the control channel ahead of the close.
         let frame = ctrl_rx.try_recv().expect("reason frame delivered");
         match frame {
-            WsMessage::Text(t) => {
-                assert!(t.as_str().contains("blocked: banned"), "carries the reason");
-                assert!(t.as_str().contains("false"), "is an OK false frame");
+            RelayFrame::Text(text) => {
+                assert!(text.contains("blocked: banned"), "carries the reason");
+                assert!(text.contains("false"), "is an OK false frame");
             }
             other => panic!("expected text frame, got {other:?}"),
         }
@@ -1833,13 +1832,9 @@ mod tests {
         for ctrl_rx in [&mut ctrl_a, &mut ctrl_b] {
             let frame = ctrl_rx.try_recv().expect("close frame delivered");
             match frame {
-                WsMessage::Close(Some(close)) => {
-                    assert_eq!(
-                        close.code,
-                        axum::extract::ws::close_code::RESTART,
-                        "close code is 1012 Service Restart"
-                    );
-                    assert_eq!(close.reason.as_str(), "relay restarting");
+                RelayFrame::Close { code, reason } => {
+                    assert_eq!(code, 1012, "close code is 1012 Service Restart");
+                    assert_eq!(reason, "relay restarting");
                 }
                 other => panic!("expected a restart close frame, got {other:?}"),
             }
@@ -1867,7 +1862,7 @@ mod tests {
         );
         // Wedge the 1-slot control channel.
         ctrl_tx
-            .try_send(WsMessage::Text("wedge".into()))
+            .try_send(RelayFrame::Text("wedge".into()))
             .expect("fill control channel");
 
         let closed = mgr.drain_all();
@@ -1880,7 +1875,7 @@ mod tests {
         // Only the wedge frame is present — the close was dropped, not queued.
         assert!(matches!(
             ctrl_rx.try_recv().expect("wedge frame"),
-            WsMessage::Text(_)
+            RelayFrame::Text(_)
         ));
         assert!(ctrl_rx.try_recv().is_err(), "no second frame queued");
     }
@@ -1918,13 +1913,12 @@ mod tests {
             "late registration is cancelled by the sticky drain flag"
         );
         match ctrl_rx.try_recv().expect("close frame delivered") {
-            WsMessage::Close(Some(close)) => {
+            RelayFrame::Close { code, reason } => {
                 assert_eq!(
-                    close.code,
-                    axum::extract::ws::close_code::RESTART,
+                    code, 1012,
                     "late registration still gets the 1012 restart close"
                 );
-                assert_eq!(close.reason.as_str(), "relay restarting");
+                assert_eq!(reason, "relay restarting");
             }
             other => panic!("expected a restart close frame, got {other:?}"),
         }

@@ -119,6 +119,66 @@ void main() {
       expect(loaded.first.pubkey, 'abc123');
     });
 
+    test('persists validated NIP-17 and FIPS preferences', () async {
+      const gatewayPubkey =
+          '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+      final community = Community.create(
+        name: 'Private',
+        relayUrl: 'https://relay.example.com',
+        relayTransport: RelayTransportMode.nip17,
+        nip17GatewayPubkey: gatewayPubkey,
+        nip17PublicRelayUrls: const [
+          'wss://relay-one.example',
+          'wss://relay-two.example',
+        ],
+        preferFips: true,
+      );
+
+      await storage.save(community);
+      final loaded = (await storage.loadAll()).single;
+
+      expect(loaded.relayTransport, RelayTransportMode.nip17);
+      expect(loaded.nip17GatewayPubkey, gatewayPubkey);
+      expect(loaded.nip17PublicRelayUrls, community.nip17PublicRelayUrls);
+      expect(loaded.preferFips, isTrue);
+    });
+
+    test(
+      'falls back to direct transport for malformed stored NIP-17 config',
+      () async {
+        fakeSecure['buzz_communities'] = jsonEncode([
+          {
+            'id': 'community-1',
+            'name': 'Malformed',
+            'relayUrl': 'https://relay.example.com',
+            'relayTransport': 'nip17',
+            'nip17GatewayPubkey': 'not-a-pubkey',
+            'nip17PublicRelayUrls': ['https://not-a-websocket.example'],
+            'preferFips': true,
+            'addedAt': DateTime.utc(2026).toIso8601String(),
+          },
+        ]);
+
+        final loaded = (await storage.loadAll()).single;
+
+        expect(loaded.relayTransport, RelayTransportMode.direct);
+        expect(loaded.nip17GatewayPubkey, isNull);
+        expect(loaded.nip17PublicRelayUrls, isEmpty);
+        expect(loaded.preferFips, isTrue);
+      },
+    );
+
+    test('rejects incomplete programmatic NIP-17 configuration', () {
+      expect(
+        () => Community.create(
+          name: 'Invalid',
+          relayUrl: 'https://relay.example.com',
+          relayTransport: RelayTransportMode.nip17,
+        ),
+        throwsArgumentError,
+      );
+    });
+
     test('save updates existing community with same id', () async {
       final ws = Community.create(
         name: 'Original',

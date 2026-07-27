@@ -34,3 +34,30 @@ This feature publishes discovery only. It does not proxy Buzz WebSocket traffic
 through Nostr. A relay whose `RELAY_URL` is not publicly reachable still needs
 the NIP-17 gateway transport before a mobile client can use it through public
 relays.
+
+## NIP-17 Gateway
+
+`buzz-relay` can also run an opt-in NIP-17 transport gateway. It receives
+gift-wrapped NIP-01 frames from public relays and dispatches them through the
+same authenticated virtual connection path as a direct WebSocket client.
+
+```sh
+BUZZ_NIP17_GATEWAY_ENABLED=true
+BUZZ_NIP17_GATEWAY_PRIVATE_KEY=<stable hex or nsec private key>
+BUZZ_NIP17_GATEWAY_RELAYS=wss://relay.example,wss://relay-backup.example
+```
+
+The private key is a dedicated gateway identity. Keep it stable and private;
+clients use its public key as `gatewayPubkey`. The runtime subscribes to kind
+`1059` events with a `#p` filter for that public key, validates and decrypts
+NIP-59 envelopes, and opens one virtual session for each verified inner sender
+and deployment tenant. It encrypts ordinary relay responses back to the
+verified sender and publishes them on the public relay that delivered the most
+recent accepted request for that session.
+
+This is not a general multi-tenant ingress. Gateway traffic is always bound to
+the community resolved from `RELAY_URL`; encrypted client content cannot select
+another tenant. The public relays are availability dependencies. The runtime
+reconnects after a dropped public relay connection, but does not persist virtual
+sessions or provide cross-relay response failover. Duplicate copies of one
+gift-wrap event are deduplicated per live session (up to 1,024 event IDs).

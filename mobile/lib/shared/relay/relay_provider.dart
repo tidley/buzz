@@ -1,6 +1,7 @@
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:nostr/nostr.dart' as nostr;
 
+import '../community/community.dart';
 import '../community/community_provider.dart';
 import 'relay_client.dart';
 
@@ -14,8 +15,24 @@ class RelayConfig {
 
   /// Nostr secret key (bech32 nsec) for signing events and NIP-42 AUTH.
   final String? nsec;
+  final RelayTransportMode relayTransport;
+  final String? nip17GatewayPubkey;
+  final List<String> nip17PublicRelayUrls;
 
-  const RelayConfig({required this.baseUrl, this.nsec});
+  /// Stored preference for FIPS-capable builds. It does not change crypto in
+  /// the Dart client.
+  final bool preferFips;
+
+  const RelayConfig({
+    required this.baseUrl,
+    this.nsec,
+    this.relayTransport = RelayTransportMode.direct,
+    this.nip17GatewayPubkey,
+    this.nip17PublicRelayUrls = const [],
+    this.preferFips = false,
+  });
+
+  bool get usesNip17 => relayTransport == RelayTransportMode.nip17;
 
   /// Derive the websocket URL from the HTTP base URL.
   String get wsUrl {
@@ -46,15 +63,36 @@ class RelayConfigNotifier extends Notifier<RelayConfig> {
     final activeAsync = ref.watch(activeCommunityProvider);
     final active = activeAsync.value;
     if (active != null) {
-      return RelayConfig(baseUrl: active.relayUrl, nsec: active.nsec);
+      return RelayConfig(
+        baseUrl: active.relayUrl,
+        nsec: active.nsec,
+        relayTransport: active.relayTransport,
+        nip17GatewayPubkey: active.nip17GatewayPubkey,
+        nip17PublicRelayUrls: active.nip17PublicRelayUrls,
+        preferFips: active.preferFips,
+      );
     }
 
     // Fallback to compile-time env config (dev mode).
     return const RelayConfig(baseUrl: Env.relayUrl);
   }
 
-  void update({required String baseUrl, String? nsec}) {
-    state = RelayConfig(baseUrl: baseUrl, nsec: nsec);
+  void update({
+    required String baseUrl,
+    String? nsec,
+    RelayTransportMode relayTransport = RelayTransportMode.direct,
+    String? nip17GatewayPubkey,
+    List<String> nip17PublicRelayUrls = const [],
+    bool preferFips = false,
+  }) {
+    state = RelayConfig(
+      baseUrl: baseUrl,
+      nsec: nsec,
+      relayTransport: relayTransport,
+      nip17GatewayPubkey: nip17GatewayPubkey,
+      nip17PublicRelayUrls: nip17PublicRelayUrls,
+      preferFips: preferFips,
+    );
   }
 }
 

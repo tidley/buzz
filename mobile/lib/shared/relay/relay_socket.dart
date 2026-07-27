@@ -3,9 +3,9 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:nostr/nostr.dart' as nostr;
-import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'nostr_models.dart';
+import 'relay_transport.dart';
 
 /// Low-level websocket connection with NIP-42 authentication.
 ///
@@ -35,8 +35,9 @@ class RelaySocket {
   final void Function(List<dynamic> message) _onMessage;
   final void Function() _onConnected;
   final void Function(Object? error) _onDisconnected;
+  final RelayTransportFactory _transportFactory;
 
-  WebSocketChannel? _channel;
+  RelayTransport? _transport;
   StreamSubscription<dynamic>? _subscription;
   SocketState _state = SocketState.disconnected;
   Completer<void>? _authCompleter;
@@ -51,11 +52,13 @@ class RelaySocket {
     required void Function(List<dynamic> message) onMessage,
     required void Function() onConnected,
     required void Function(Object? error) onDisconnected,
+    RelayTransportFactory transportFactory = WebSocketRelayTransport.connect,
   }) : _wsUrl = wsUrl,
        _nsec = nsec,
        _onMessage = onMessage,
        _onConnected = onConnected,
-       _onDisconnected = onDisconnected;
+       _onDisconnected = onDisconnected,
+       _transportFactory = transportFactory;
 
   /// Connect to the relay and complete NIP-42 authentication.
   Future<void> connect() async {
@@ -63,8 +66,8 @@ class RelaySocket {
     _state = SocketState.connecting;
 
     try {
-      _channel = WebSocketChannel.connect(Uri.parse(_wsUrl));
-      await _channel!.ready;
+      _transport = _transportFactory(Uri.parse(_wsUrl));
+      await _transport!.ready;
     } catch (e) {
       _state = SocketState.disconnected;
       _onDisconnected(e);
@@ -73,7 +76,7 @@ class RelaySocket {
 
     // The channel may have been disposed while we were awaiting ready
     // (e.g. provider rebuild triggered dispose() concurrently).
-    if (_channel == null) {
+    if (_transport == null) {
       _state = SocketState.disconnected;
       return;
     }
@@ -81,7 +84,7 @@ class RelaySocket {
     _state = SocketState.authenticating;
     _authCompleter = Completer<void>();
 
-    _subscription = _channel!.stream.listen(
+    _subscription = _transport!.stream.listen(
       _handleRawMessage,
       onError: (Object error) {
         _failAuth(error);
@@ -94,6 +97,8 @@ class RelaySocket {
         _onDisconnected(null);
       },
     );
+
+    await _transport!.activate();
 
     // Wait for auth to complete (or timeout).
     _authTimeout = Timer(const Duration(seconds: 8), () {
@@ -118,23 +123,26 @@ class RelaySocket {
 
   /// Send a raw JSON array over the websocket.
   void send(List<dynamic> payload) {
-    _channel?.sink.add(jsonEncode(payload));
+    _transport?.send(jsonEncode(payload));
   }
 
   /// Gracefully close the connection.
   Future<void> disconnect() async {
     _resetConnection();
-    final channel = _channel;
-    _channel = null;
-    if (channel != null) {
-      await channel.sink.close();
+    final transport = _transport;
+    _transport = null;
+    if (transport != null) {
+      await transport.close();
     }
   }
 
   void dispose() {
     _resetConnection();
-    _channel?.sink.close();
-    _channel = null;
+    final transport = _transport;
+    _transport = null;
+    if (transport != null) {
+      unawaited(transport.close());
+    }
   }
 
   void _resetConnection() {

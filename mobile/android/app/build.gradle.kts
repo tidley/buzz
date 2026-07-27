@@ -174,3 +174,32 @@ gradle.taskGraph.whenReady {
 flutter {
     source = "../.."
 }
+
+// With `-PbuzzFipsMobile`, cargo-ndk packages the Android FFI library as jniLibs.
+val buzzFipsMobileEnabled = providers.gradleProperty("buzzFipsMobile").isPresent
+if (buzzFipsMobileEnabled) {
+    val workspaceRoot = rootProject.projectDir.parentFile.parentFile
+    val bridgeManifest = workspaceRoot.resolve("crates/buzz-fips-mobile/Cargo.toml")
+    val jniLibs = project.layout.projectDirectory.dir("src/main/jniLibs")
+    val androidAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+
+    val buildBuzzFipsMobile =
+        tasks.register<Exec>("buildBuzzFipsMobile") {
+            workingDir = workspaceRoot
+            commandLine(
+                "cargo",
+                "ndk",
+                *androidAbis.flatMap { listOf("-t", it) }.toTypedArray(),
+                "-o",
+                jniLibs.asFile.absolutePath,
+                "build",
+                "--manifest-path",
+                bridgeManifest.absolutePath,
+                "--release",
+            )
+        }
+
+    tasks.matching { it.name in setOf("assembleDebug", "assembleRelease", "bundleRelease") }.configureEach {
+        dependsOn(buildBuzzFipsMobile)
+    }
+}

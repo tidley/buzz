@@ -1,0 +1,19 @@
+[package]
+name = "buzz-fips-mobile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Android Flutter FFI boundary for the optional FIPS mesh runtime"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[features]
+default = []
+
+[dependencies]
+# Keep the upstream source and revision explicit for reproducible Android builds.
+fips-mobile = { git = "https://github.com/tidley/fips.git", rev = "3f58f1c", package = "fips-mobile", default-features = false, features = ["nostr-discovery"] }
+tokio.workspace = true

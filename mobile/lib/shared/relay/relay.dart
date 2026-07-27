@@ -1,4 +1,5 @@
 export 'app_lifecycle_provider.dart';
+export 'fips_relay_transport.dart';
 export 'media_auth.dart';
 export 'media_image.dart';
 export 'media_upload.dart';
@@ -8,4 +9,5 @@ export 'relay_client.dart';
 export 'relay_provider.dart';
 export 'relay_session.dart';
 export 'relay_socket.dart';
+export 'relay_transport.dart';
 export 'signed_event_relay.dart';

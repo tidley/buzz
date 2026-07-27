@@ -55,6 +55,15 @@ pub struct DiscoveryConfig {
     pub relays: Vec<String>,
 }
 
+/// Opt-in NIP-17 gateway transport configuration.
+#[derive(Debug, Clone)]
+pub struct Nip17GatewayConfig {
+    /// Stable Nostr secret key used to decrypt requests and sign responses.
+    pub private_key: String,
+    /// Public relays carrying gift-wrap request and response envelopes.
+    pub relays: Vec<String>,
+}
+
 /// Relay runtime configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -101,6 +110,8 @@ pub struct Config {
     pub relay_private_key: Option<String>,
     /// Optional public Nostr discovery configuration.
     pub discovery: Option<DiscoveryConfig>,
+    /// Optional NIP-17 gateway transport configuration.
+    pub nip17_gateway: Option<Nip17GatewayConfig>,
     /// Optional Unix Domain Socket path. When set, the relay also listens on this
     /// UDS for traffic (e.g. service mesh sidecar). Health probes still use TCP.
     pub uds_path: Option<String>,
@@ -445,6 +456,64 @@ fn discovery_config_from_env() -> Result<Option<DiscoveryConfig>, ConfigError> {
     }))
 }
 
+fn nip17_gateway_config_from_env() -> Result<Option<Nip17GatewayConfig>, ConfigError> {
+    if !parse_bool("BUZZ_NIP17_GATEWAY_ENABLED", false)? {
+        return Ok(None);
+    }
+    let private_key = std::env::var("BUZZ_NIP17_GATEWAY_PRIVATE_KEY")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ConfigError::InvalidValue(
+                "BUZZ_NIP17_GATEWAY_PRIVATE_KEY is required when BUZZ_NIP17_GATEWAY_ENABLED=true"
+                    .to_string(),
+            )
+        })?;
+    nostr::Keys::parse(&private_key).map_err(|error| {
+        ConfigError::InvalidValue(format!(
+            "BUZZ_NIP17_GATEWAY_PRIVATE_KEY is not a valid Nostr secret key: {error}"
+        ))
+    })?;
+
+    let raw_relays = std::env::var("BUZZ_NIP17_GATEWAY_RELAYS").unwrap_or_default();
+    let mut relays = Vec::new();
+    for raw in raw_relays
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+    {
+        let url = url::Url::parse(raw.trim()).map_err(|error| {
+            ConfigError::InvalidValue(format!(
+                "BUZZ_NIP17_GATEWAY_RELAYS contains an invalid relay URL: {error}"
+            ))
+        })?;
+        if !matches!(url.scheme(), "ws" | "wss")
+            || url.host().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_NIP17_GATEWAY_RELAYS entries must be ws:// or wss:// URLs without credentials, query, or fragment".to_string(),
+            ));
+        }
+        let normalized = url.to_string();
+        if !relays.contains(&normalized) {
+            relays.push(normalized);
+        }
+    }
+    if relays.is_empty() {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_NIP17_GATEWAY_RELAYS must contain at least one relay URL when BUZZ_NIP17_GATEWAY_ENABLED=true".to_string(),
+        ));
+    }
+    Ok(Some(Nip17GatewayConfig {
+        private_key,
+        relays,
+    }))
+}
+
 fn parse_optional_bool(name: &str) -> Result<bool, ConfigError> {
     parse_bool(name, false)
 }
@@ -670,6 +739,7 @@ impl Config {
 
         let relay_private_key = std::env::var("BUZZ_RELAY_PRIVATE_KEY").ok();
         let discovery = discovery_config_from_env()?;
+        let nip17_gateway = nip17_gateway_config_from_env()?;
 
         let uds_path = std::env::var("BUZZ_UDS_PATH")
             .ok()
@@ -957,6 +1027,7 @@ impl Config {
             cors_origins,
             relay_private_key,
             discovery,
+            nip17_gateway,
             uds_path,
             health_port,
             metrics_port,
@@ -1099,6 +1170,49 @@ mod tests {
             missing_path,
             Err(ConfigError::InvalidValue(message)) if message.contains("BUZZ_DISCOVERY_IDENTITY_PATH")
         ));
+    }
+
+    #[test]
+    fn nip17_gateway_requires_a_key_and_valid_public_relays() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous_enabled = std::env::var_os("BUZZ_NIP17_GATEWAY_ENABLED");
+        let previous_key = std::env::var_os("BUZZ_NIP17_GATEWAY_PRIVATE_KEY");
+        let previous_relays = std::env::var_os("BUZZ_NIP17_GATEWAY_RELAYS");
+
+        std::env::set_var("BUZZ_NIP17_GATEWAY_ENABLED", "true");
+        std::env::remove_var("BUZZ_NIP17_GATEWAY_PRIVATE_KEY");
+        std::env::set_var("BUZZ_NIP17_GATEWAY_RELAYS", "wss://relay.example");
+        let missing_key = nip17_gateway_config_from_env();
+
+        std::env::set_var(
+            "BUZZ_NIP17_GATEWAY_PRIVATE_KEY",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        );
+        std::env::set_var(
+            "BUZZ_NIP17_GATEWAY_RELAYS",
+            "wss://relay.example,wss://relay.example",
+        );
+        let gateway = nip17_gateway_config_from_env()
+            .expect("gateway config")
+            .expect("enabled gateway");
+
+        for (name, previous) in [
+            ("BUZZ_NIP17_GATEWAY_ENABLED", previous_enabled),
+            ("BUZZ_NIP17_GATEWAY_PRIVATE_KEY", previous_key),
+            ("BUZZ_NIP17_GATEWAY_RELAYS", previous_relays),
+        ] {
+            if let Some(value) = previous {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+
+        assert!(matches!(
+            missing_key,
+            Err(ConfigError::InvalidValue(message)) if message.contains("BUZZ_NIP17_GATEWAY_PRIVATE_KEY")
+        ));
+        assert_eq!(gateway.relays, vec!["wss://relay.example/"]);
     }
 
     #[test]

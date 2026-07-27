@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures_util::{Sink, SinkExt, StreamExt};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use tracing::{debug, info, trace, warn};
@@ -20,7 +20,8 @@ use nostr::Filter;
 
 use crate::handlers;
 use crate::protocol::{ClientMessage, RelayMessage};
-use crate::state::{run_registered_community_connection, AppState};
+use crate::state::{run_registered_community_connection, AppState, CommunityConnectionGuard};
+use crate::transport::RelayFrame;
 use buzz_pubsub::EventTopic;
 
 /// Maximum time a new socket may hold a connection slot without completing NIP-42 auth.
@@ -64,11 +65,11 @@ pub struct ConnectionState {
     /// Active subscriptions keyed by subscription ID.
     pub subscriptions: ConnectionSubscriptions,
     /// Sender for outbound data messages (EVENT, NOTICE, OK, etc.).
-    pub send_tx: mpsc::Sender<WsMessage>,
+    pub send_tx: mpsc::Sender<RelayFrame>,
     /// Sender for outbound control frames (Pong, Close).
     /// Separate channel with priority drain — if this channel fills too,
     /// the connection is closed (writer is completely stalled).
-    pub ctrl_tx: mpsc::Sender<WsMessage>,
+    pub ctrl_tx: mpsc::Sender<RelayFrame>,
     /// Token used to signal graceful shutdown of this connection's tasks.
     pub cancel: CancellationToken,
     /// Consecutive buffer-full events. Cancel only after `grace_limit`.
@@ -79,6 +80,30 @@ pub struct ConnectionState {
     pub grace_limit: u8,
 }
 
+/// An in-process connection which uses the normal NIP-01 relay dispatcher.
+///
+/// Tunnel adapters supply and consume [`RelayFrame`] values without depending
+/// on Axum. Call [`Self::close`] when the adapter session ends so subscriptions
+/// and presence are released just as they are for a WebSocket disconnect.
+pub struct VirtualConnection {
+    conn: Arc<ConnectionState>,
+    state: Arc<AppState>,
+    data_rx: mpsc::Receiver<RelayFrame>,
+    ctrl_rx: mpsc::Receiver<RelayFrame>,
+    permit: OwnedSemaphorePermit,
+    community_guard: CommunityConnectionGuard,
+    auth_timeout_task: tokio::task::JoinHandle<()>,
+}
+
+/// Why a virtual connection could not be opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualConnectionError {
+    /// The relay has reached its configured connection limit.
+    ConnectionLimitReached,
+    /// The tenant was archived or could not be revalidated.
+    CommunityUnavailable,
+}
+
 impl ConnectionState {
     /// Sends a data message to this connection's outbound channel.
     ///
@@ -86,7 +111,7 @@ impl ConnectionState {
     /// `grace_limit` occurrences log a warning; sustained backpressure
     /// cancels the connection to prevent unbounded memory growth.
     pub fn send(&self, msg: String) -> bool {
-        match self.send_tx.try_send(WsMessage::Text(msg.into())) {
+        match self.send_tx.try_send(RelayFrame::Text(msg)) {
             Ok(_) => {
                 // Successful send resets the grace counter.
                 self.backpressure_count.store(0, Ordering::Relaxed);
@@ -108,6 +133,141 @@ impl ConnectionState {
                 false
             }
         }
+    }
+}
+
+impl VirtualConnection {
+    /// Opens a transport-neutral relay session and queues its NIP-42 challenge.
+    pub async fn open(
+        state: Arc<AppState>,
+        addr: SocketAddr,
+        tenant: TenantContext,
+    ) -> Result<Self, VirtualConnectionError> {
+        let permit = state
+            .conn_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| VirtualConnectionError::ConnectionLimitReached)?;
+        let conn_id = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+        let community_guard =
+            state
+                .community_connections
+                .register(conn_id, tenant.community(), cancel.clone());
+        if !matches!(
+            state.db.is_community_active(tenant.community()).await,
+            Ok(true)
+        ) || cancel.is_cancelled()
+        {
+            cancel.cancel();
+            return Err(VirtualConnectionError::CommunityUnavailable);
+        }
+
+        let challenge = generate_challenge();
+        let (tx, data_rx) = mpsc::channel(state.config.send_buffer_size);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
+        let backpressure_count = Arc::new(AtomicU8::new(0));
+        let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let conn = Arc::new(ConnectionState {
+            conn_id,
+            tenant,
+            remote_addr: addr,
+            auth_state: RwLock::new(AuthState::Pending {
+                challenge: challenge.clone(),
+            }),
+            subscriptions: Arc::clone(&subscriptions),
+            send_tx: tx.clone(),
+            ctrl_tx: ctrl_tx.clone(),
+            cancel: cancel.clone(),
+            backpressure_count: Arc::clone(&backpressure_count),
+            grace_limit: state.config.slow_client_grace_limit,
+        });
+        state.conn_manager.register(
+            conn_id,
+            tx.clone(),
+            ctrl_tx,
+            cancel.clone(),
+            conn.tenant.community(),
+            backpressure_count,
+            subscriptions,
+            state.config.slow_client_grace_limit,
+        );
+        // The receiver is retained by this session, so this cannot fail here.
+        let _ = tx
+            .send(RelayFrame::Text(RelayMessage::auth_challenge(&challenge)))
+            .await;
+
+        let auth_timeout_conn = Arc::clone(&conn);
+        let auth_timeout_task = tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(AUTH_TIMEOUT) => {
+                    if !matches!(*auth_timeout_conn.auth_state.read().await, AuthState::Authenticated(_)) {
+                        auth_timeout_conn.cancel.cancel();
+                    }
+                }
+                _ = cancel.cancelled() => {}
+            }
+        });
+
+        Ok(Self {
+            conn,
+            state,
+            data_rx,
+            ctrl_rx,
+            permit,
+            community_guard,
+            auth_timeout_task,
+        })
+    }
+
+    /// Dispatches one incoming frame through the same auth and protocol handlers
+    /// used by WebSocket connections.
+    pub async fn receive_frame(&self, frame: RelayFrame) {
+        if !handle_relay_frame(frame, Arc::clone(&self.conn), Arc::clone(&self.state), None).await {
+            self.conn.cancel.cancel();
+        }
+    }
+
+    /// Returns whether the session has authenticated as `pubkey`.
+    pub async fn is_authenticated_as(&self, pubkey: &[u8]) -> bool {
+        matches!(
+            &*self.conn.auth_state.read().await,
+            AuthState::Authenticated(context) if context.pubkey.to_bytes().as_slice() == pubkey
+        )
+    }
+
+    /// Returns whether NIP-42 authentication has completed successfully.
+    pub async fn is_authenticated(&self) -> bool {
+        matches!(
+            *self.conn.auth_state.read().await,
+            AuthState::Authenticated(_)
+        )
+    }
+
+    /// Receives the next relay response, prioritizing control frames.
+    pub async fn next_frame(&mut self) -> Option<RelayFrame> {
+        if let Ok(frame) = self.ctrl_rx.try_recv() {
+            return Some(frame);
+        }
+        if let Ok(frame) = self.data_rx.try_recv() {
+            return Some(frame);
+        }
+        tokio::select! {
+            biased;
+            Some(frame) = self.ctrl_rx.recv() => Some(frame),
+            Some(frame) = self.data_rx.recv() => Some(frame),
+            _ = self.conn.cancel.cancelled() => None,
+            else => None,
+        }
+    }
+
+    /// Closes the session and releases its subscriptions and presence state.
+    pub async fn close(self) {
+        self.conn.cancel.cancel();
+        self.auth_timeout_task.abort();
+        cleanup_connection(&self.conn, &self.state).await;
+        drop(self.community_guard);
+        drop(self.permit);
     }
 }
 
@@ -156,10 +316,10 @@ async fn handle_active_connection(
 
     let challenge = generate_challenge();
 
-    let (tx, rx) = mpsc::channel::<WsMessage>(state.config.send_buffer_size);
+    let (tx, rx) = mpsc::channel::<RelayFrame>(state.config.send_buffer_size);
     // Control channel for Pong/Close — small capacity, guaranteed delivery
     // even when the data buffer is full.
-    let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<RelayFrame>(8);
 
     let backpressure_count = Arc::new(AtomicU8::new(0));
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
@@ -187,11 +347,7 @@ async fn handle_active_connection(
     .increment(1);
 
     let challenge_msg = RelayMessage::auth_challenge(&challenge);
-    if tx
-        .send(WsMessage::Text(challenge_msg.into()))
-        .await
-        .is_err()
-    {
+    if tx.send(RelayFrame::Text(challenge_msg)).await.is_err() {
         warn!(conn_id = %conn_id, "Failed to send AUTH challenge — client disconnected immediately");
         return;
     }
@@ -262,25 +418,7 @@ async fn handle_active_connection(
     let _ = heartbeat_task.await;
     let _ = auth_timeout_task.await;
 
-    for removed in state.sub_registry.remove_connection(conn.conn_id) {
-        state
-            .pubsub
-            .release_topic(&conn.tenant, topic_for_subscription(removed.channel_id))
-            .await;
-    }
-    state.conn_manager.deregister(conn.conn_id);
-    if let AuthState::Authenticated(ref auth_ctx) = *conn.auth_state.read().await {
-        let remaining = state.conn_manager.connection_ids_for_pubkey_in_community(
-            conn.tenant.community(),
-            auth_ctx.pubkey.to_bytes().as_slice(),
-        );
-        if remaining.is_empty() {
-            let _ = state
-                .pubsub
-                .clear_presence(&conn.tenant, &auth_ctx.pubkey)
-                .await;
-        }
-    }
+    cleanup_connection(&conn, &state).await;
     metrics::gauge!("buzz_ws_connections_active").decrement(1.0);
     info!(conn_id = %conn_id, addr = %addr, "WebSocket connection closed");
 
@@ -295,8 +433,8 @@ async fn handle_active_connection(
 /// treat a full control channel as terminal (Bug 7 fix).
 async fn send_loop(
     ws_send: futures_util::stream::SplitSink<WebSocket, WsMessage>,
-    data_rx: mpsc::Receiver<WsMessage>,
-    ctrl_rx: mpsc::Receiver<WsMessage>,
+    data_rx: mpsc::Receiver<RelayFrame>,
+    ctrl_rx: mpsc::Receiver<RelayFrame>,
     cancel: CancellationToken,
 ) {
     send_loop_inner(ws_send, data_rx, ctrl_rx, cancel).await;
@@ -304,8 +442,8 @@ async fn send_loop(
 
 async fn send_loop_inner<S>(
     mut ws_send: S,
-    mut data_rx: mpsc::Receiver<WsMessage>,
-    mut ctrl_rx: mpsc::Receiver<WsMessage>,
+    mut data_rx: mpsc::Receiver<RelayFrame>,
+    mut ctrl_rx: mpsc::Receiver<RelayFrame>,
     cancel: CancellationToken,
 ) where
     S: Sink<WsMessage> + Unpin,
@@ -313,7 +451,11 @@ async fn send_loop_inner<S>(
     loop {
         // Priority: drain all pending control frames before data.
         while let Ok(ctrl_msg) = ctrl_rx.try_recv() {
-            if ws_send.send(ctrl_msg).await.is_err() {
+            if ws_send
+                .send(relay_frame_to_ws_message(ctrl_msg))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -330,7 +472,7 @@ async fn send_loop_inner<S>(
                 // (the top-of-loop drain does not run again after we break).
                 // This makes "queue frame on ctrl, then cancel" a safe idiom.
                 while let Ok(ctrl_msg) = ctrl_rx.try_recv() {
-                    if ws_send.send(ctrl_msg).await.is_err() {
+                    if ws_send.send(relay_frame_to_ws_message(ctrl_msg)).await.is_err() {
                         break;
                     }
                 }
@@ -338,20 +480,20 @@ async fn send_loop_inner<S>(
                 break;
             }
             Some(ctrl_msg) = ctrl_rx.recv() => {
-                if ws_send.send(ctrl_msg).await.is_err() {
+                if ws_send.send(relay_frame_to_ws_message(ctrl_msg)).await.is_err() {
                     break;
                 }
             }
             Some(msg) = data_rx.recv() => {
                 let mut batched = 1usize;
-                if ws_send.feed(msg).await.is_err() {
+                if ws_send.feed(relay_frame_to_ws_message(msg)).await.is_err() {
                     break;
                 }
 
                 while batched < MAX_WS_SEND_BATCH {
                     match data_rx.try_recv() {
                         Ok(next) => {
-                            if ws_send.feed(next).await.is_err() {
+                            if ws_send.feed(relay_frame_to_ws_message(next)).await.is_err() {
                                 return;
                             }
                             batched += 1;
@@ -370,13 +512,45 @@ async fn send_loop_inner<S>(
     }
 }
 
+/// Converts an Axum WebSocket message as it enters the transport-neutral relay.
+fn ws_message_to_relay_frame(message: WsMessage) -> RelayFrame {
+    match message {
+        WsMessage::Text(text) => RelayFrame::Text(text.to_string()),
+        WsMessage::Binary(bytes) => RelayFrame::Binary(bytes.to_vec()),
+        WsMessage::Ping(_) => RelayFrame::Ping,
+        WsMessage::Pong(_) => RelayFrame::Pong,
+        WsMessage::Close(close) => {
+            let (code, reason) = close
+                .map(|close| (close.code, close.reason.to_string()))
+                .unwrap_or((1000, String::new()));
+            RelayFrame::Close { code, reason }
+        }
+    }
+}
+
+/// Converts relay frames only when they leave through Axum's WebSocket sink.
+fn relay_frame_to_ws_message(frame: RelayFrame) -> WsMessage {
+    match frame {
+        RelayFrame::Text(text) => WsMessage::Text(text.into()),
+        RelayFrame::Binary(bytes) => WsMessage::Binary(bytes.into()),
+        RelayFrame::Ping => WsMessage::Ping(axum::body::Bytes::new()),
+        RelayFrame::Pong => WsMessage::Pong(axum::body::Bytes::new()),
+        RelayFrame::Close { code, reason } => {
+            WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                code,
+                reason: reason.into(),
+            }))
+        }
+    }
+}
+
 /// 3 missed pongs → disconnect.
 ///
 /// Sends Ping through the control channel so it isn't blocked by a full
 /// data buffer. Uses `try_send` to keep the select loop responsive to
 /// cancellation — a full control channel means the writer is stalled.
 async fn heartbeat_loop(
-    ctrl_tx: mpsc::Sender<WsMessage>,
+    ctrl_tx: mpsc::Sender<RelayFrame>,
     missed_pongs: Arc<AtomicU8>,
     cancel: CancellationToken,
 ) {
@@ -394,7 +568,7 @@ async fn heartbeat_loop(
                     cancel.cancel();
                     break;
                 }
-                if ctrl_tx.try_send(WsMessage::Ping(axum::body::Bytes::new())).is_err() {
+                if ctrl_tx.try_send(RelayFrame::Ping).is_err() {
                     warn!("control channel full — cannot send Ping, closing");
                     cancel.cancel();
                     break;
@@ -415,63 +589,26 @@ async fn recv_loop(
     loop {
         tokio::select! {
             msg = ws_recv.next() => {
-                match msg {
-                    Some(Ok(WsMessage::Text(text))) => {
-                        let max_frame_bytes = state.config.max_frame_bytes;
-                        if text.len() > max_frame_bytes {
-                            warn!(
-                                conn_id = %conn.conn_id,
-                                bytes = text.len(),
-                                max_frame_bytes,
-                                "frame too large — disconnecting"
-                            );
-                            conn.send(format!(
-                                r#"["NOTICE","error: frame too large ({} bytes, limit {})"]"#,
-                                text.len(),
-                                max_frame_bytes
-                            ));
+                match msg.map(|result| result.map(ws_message_to_relay_frame)) {
+                    Some(Ok(frame @ (RelayFrame::Text(_) | RelayFrame::Binary(_)))) => {
+                        if !handle_relay_frame(frame, Arc::clone(&conn), Arc::clone(&state), Some(&missed_pongs)).await {
                             break;
                         }
-                        trace!(len = text.len(), "frame received");
-                        handle_text_message(text.to_string(), Arc::clone(&conn), Arc::clone(&state)).await;
                     }
-                    Some(Ok(WsMessage::Binary(bytes))) => {
-                        let max_frame_bytes = state.config.max_frame_bytes;
-                        if bytes.len() > max_frame_bytes {
-                            warn!(
-                                conn_id = %conn.conn_id,
-                                bytes = bytes.len(),
-                                max_frame_bytes,
-                                "binary frame too large — disconnecting"
-                            );
-                            conn.send(format!(
-                                r#"["NOTICE","error: binary frame too large ({} bytes, limit {})"]"#,
-                                bytes.len(),
-                                max_frame_bytes
-                            ));
-                            break;
-                        }
-                        // Binary frames: attempt UTF-8 decode and treat as text. Some clients
-                        // (notably certain Nostr libraries) send text payloads in binary frames.
-                        // NIP-01 is text-only, but accepting binary is a common relay extension.
-                        if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                            handle_text_message(text, Arc::clone(&conn), Arc::clone(&state)).await;
-                        }
-                    }
-                    Some(Ok(WsMessage::Pong(_))) => {
+                    Some(Ok(RelayFrame::Pong)) => {
                         missed_pongs.store(0, Ordering::Relaxed);
                     }
-                    Some(Ok(WsMessage::Ping(data))) => {
+                    Some(Ok(RelayFrame::Ping)) => {
                         // Send Pong through the control channel — priority
                         // delivery even when the data buffer is full (Bug 7 fix).
-                        if conn.ctrl_tx.try_send(WsMessage::Pong(data)).is_err() {
+                        if conn.ctrl_tx.try_send(RelayFrame::Pong).is_err() {
                             // Control channel full means the socket writer is
                             // completely stalled — treat as terminal.
                             warn!(conn_id = %conn.conn_id, "control channel full — cannot send Pong, closing");
                             break;
                         }
                     }
-                    Some(Ok(WsMessage::Close(_))) | None => {
+                    Some(Ok(RelayFrame::Close { .. })) | None => {
                         debug!("WebSocket closed by client");
                         break;
                     }
@@ -482,6 +619,78 @@ async fn recv_loop(
                 }
             }
             _ = cancel.cancelled() => break,
+        }
+    }
+}
+
+/// Applies transport-neutral frame validation and NIP-01 dispatch.
+///
+/// `missed_pongs` is supplied only by transports that emit keepalive frames.
+async fn handle_relay_frame(
+    frame: RelayFrame,
+    conn: Arc<ConnectionState>,
+    state: Arc<AppState>,
+    missed_pongs: Option<&Arc<AtomicU8>>,
+) -> bool {
+    match frame {
+        RelayFrame::Text(text) => {
+            if text.len() > state.config.max_frame_bytes {
+                conn.send(format!(
+                    r#"["NOTICE","error: frame too large ({} bytes, limit {})"]"#,
+                    text.len(),
+                    state.config.max_frame_bytes
+                ));
+                return false;
+            }
+            trace!(len = text.len(), "frame received");
+            handle_text_message(text, conn, state).await;
+        }
+        RelayFrame::Binary(bytes) => {
+            if bytes.len() > state.config.max_frame_bytes {
+                conn.send(format!(
+                    r#"["NOTICE","error: binary frame too large ({} bytes, limit {})"]"#,
+                    bytes.len(),
+                    state.config.max_frame_bytes
+                ));
+                return false;
+            }
+            if let Ok(text) = String::from_utf8(bytes) {
+                handle_text_message(text, conn, state).await;
+            }
+        }
+        RelayFrame::Pong => {
+            if let Some(missed_pongs) = missed_pongs {
+                missed_pongs.store(0, Ordering::Relaxed);
+            }
+        }
+        RelayFrame::Ping => {
+            if conn.ctrl_tx.try_send(RelayFrame::Pong).is_err() {
+                return false;
+            }
+        }
+        RelayFrame::Close { .. } => return false,
+    }
+    true
+}
+
+async fn cleanup_connection(conn: &ConnectionState, state: &AppState) {
+    for removed in state.sub_registry.remove_connection(conn.conn_id) {
+        state
+            .pubsub
+            .release_topic(&conn.tenant, topic_for_subscription(removed.channel_id))
+            .await;
+    }
+    state.conn_manager.deregister(conn.conn_id);
+    if let AuthState::Authenticated(ref auth_ctx) = *conn.auth_state.read().await {
+        let remaining = state.conn_manager.connection_ids_for_pubkey_in_community(
+            conn.tenant.community(),
+            auth_ctx.pubkey.to_bytes().as_slice(),
+        );
+        if remaining.is_empty() {
+            let _ = state
+                .pubsub
+                .clear_presence(&conn.tenant, &auth_ctx.pubkey)
+                .await;
         }
     }
 }
@@ -772,6 +981,52 @@ mod tests {
             .collect()
     }
 
+    fn test_connection(
+        send_tx: mpsc::Sender<RelayFrame>,
+        ctrl_tx: mpsc::Sender<RelayFrame>,
+    ) -> Arc<ConnectionState> {
+        Arc::new(ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: TenantContext::resolved(
+                buzz_core::CommunityId::from_uuid(Uuid::nil()),
+                "test.local",
+            ),
+            remote_addr: "127.0.0.1:1234".parse().expect("socket address"),
+            auth_state: RwLock::new(AuthState::Pending {
+                challenge: "test-challenge".to_string(),
+            }),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            cancel: CancellationToken::new(),
+            backpressure_count: Arc::new(AtomicU8::new(0)),
+            grace_limit: 3,
+        })
+    }
+
+    #[tokio::test]
+    async fn transport_neutral_dispatch_returns_the_normal_parse_notice() {
+        let state = crate::state::tests::test_state().await;
+        let (send_tx, mut send_rx) = mpsc::channel(1);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
+        let conn = test_connection(send_tx, ctrl_tx);
+
+        assert!(
+            handle_relay_frame(
+                RelayFrame::Text("not valid relay json".to_string()),
+                conn,
+                state,
+                None,
+            )
+            .await
+        );
+
+        let RelayFrame::Text(response) = send_rx.recv().await.expect("parse notice") else {
+            panic!("expected text protocol response");
+        };
+        assert!(response.starts_with("[\"NOTICE\",\"invalid message:"));
+    }
+
     #[test]
     fn req_rejections_are_subscription_scoped() {
         let reason = "rate-limited: too many concurrent requests";
@@ -785,13 +1040,27 @@ mod tests {
         assert_eq!(notice, serde_json::json!(["NOTICE", reason]));
     }
 
+    #[test]
+    fn restart_close_frame_keeps_its_code_and_reason_at_the_axum_boundary() {
+        let message = relay_frame_to_ws_message(RelayFrame::Close {
+            code: 1012,
+            reason: "relay restarting".to_string(),
+        });
+
+        let WsMessage::Close(Some(close)) = message else {
+            panic!("expected an Axum close message");
+        };
+        assert_eq!(close.code, 1012);
+        assert_eq!(close.reason.as_str(), "relay restarting");
+    }
+
     #[tokio::test]
     async fn send_loop_batches_queued_data_frames_into_one_flush() {
         let (data_tx, data_rx) = mpsc::channel(MAX_WS_SEND_BATCH);
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
         for i in 0..5 {
             data_tx
-                .send(WsMessage::Text(format!("data-{i}").into()))
+                .send(RelayFrame::Text(format!("data-{i}")))
                 .await
                 .expect("queue data frame");
         }
@@ -812,7 +1081,7 @@ mod tests {
         let (data_tx, data_rx) = mpsc::channel(1);
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
         data_tx
-            .send(WsMessage::Text("single".into()))
+            .send(RelayFrame::Text("single".into()))
             .await
             .expect("queue data frame");
 
@@ -829,15 +1098,15 @@ mod tests {
         let (data_tx, data_rx) = mpsc::channel(MAX_WS_SEND_BATCH);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
         data_tx
-            .send(WsMessage::Text("data-0".into()))
+            .send(RelayFrame::Text("data-0".into()))
             .await
             .expect("queue data frame");
         data_tx
-            .send(WsMessage::Text("data-1".into()))
+            .send(RelayFrame::Text("data-1".into()))
             .await
             .expect("queue data frame");
         ctrl_tx
-            .send(WsMessage::Text("control".into()))
+            .send(RelayFrame::Text("control".into()))
             .await
             .expect("queue control frame");
 
@@ -863,7 +1132,7 @@ mod tests {
         let (_data_tx, data_rx) = mpsc::channel(1);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
         ctrl_tx
-            .send(WsMessage::Text("blocked: you are banned".into()))
+            .send(RelayFrame::Text("blocked: you are banned".into()))
             .await
             .expect("queue ban reason frame");
 

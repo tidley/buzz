@@ -1412,7 +1412,7 @@ mod tests {
         )
         .await;
 
-        let axum::extract::ws::Message::Text(text) =
+        let crate::transport::RelayFrame::Text(text) =
             send_rx.try_recv().expect("observer rejection sent")
         else {
             panic!("expected text relay message");
@@ -1431,7 +1431,6 @@ mod tests {
         use std::sync::atomic::AtomicU8;
         use std::sync::Arc;
 
-        use axum::extract::ws::Message;
         use buzz_core::kind::{KIND_MEMBER_ADDED_NOTIFICATION, KIND_PRESENCE_UPDATE};
         use buzz_pubsub::{ChannelEvent, EventTopic};
         use nostr::{EventBuilder, Filter, Keys, Kind};
@@ -1451,7 +1450,7 @@ mod tests {
             sub_id: &str,
             filter: Filter,
             pubkey: Option<Vec<u8>>,
-        ) -> (Uuid, mpsc::Receiver<Message>) {
+        ) -> (Uuid, mpsc::Receiver<crate::transport::RelayFrame>) {
             let conn_id = Uuid::new_v4();
             let (tx, rx) = mpsc::channel(10);
             let (ctrl_tx, _ctrl_rx) = mpsc::channel(10);
@@ -1477,7 +1476,7 @@ mod tests {
         fn register_presence_sub(
             state: &AppState,
             sub_id: &str,
-        ) -> (Uuid, mpsc::Receiver<Message>) {
+        ) -> (Uuid, mpsc::Receiver<crate::transport::RelayFrame>) {
             register_global_sub(
                 state,
                 sub_id,
@@ -1490,7 +1489,7 @@ mod tests {
             state: &AppState,
             sub_id: &str,
             target: &Keys,
-        ) -> (Uuid, mpsc::Receiver<Message>) {
+        ) -> (Uuid, mpsc::Receiver<crate::transport::RelayFrame>) {
             register_global_sub(
                 state,
                 sub_id,
@@ -1517,9 +1516,9 @@ mod tests {
                 .expect("sign membership notification")
         }
 
-        fn event_from_ws_message(msg: Message) -> nostr::Event {
-            let Message::Text(text) = msg else {
-                panic!("expected text ws message");
+        fn event_from_ws_message(msg: crate::transport::RelayFrame) -> nostr::Event {
+            let crate::transport::RelayFrame::Text(text) = msg else {
+                panic!("expected text relay frame");
             };
             let v: serde_json::Value = serde_json::from_str(&text).expect("EVENT frame JSON");
             assert_eq!(v[0], "EVENT");

@@ -445,6 +445,26 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
+    // This transport is deliberately independent of the relay listener. Its
+    // public-relay envelopes are bound to the same deployment tenant that
+    // server-internal jobs use; a client can never choose another tenant in an
+    // encrypted frame.
+    if let Some(gateway) = &config.nip17_gateway {
+        let tenant = buzz_relay::tenant::bind_deployment_community(&state.db, &config.relay_url)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                "NIP-17 gateway requires RELAY_URL to resolve to an active deployment community"
+            )
+            })?;
+        buzz_relay::nip17_gateway_runtime::spawn(
+            Arc::clone(&state),
+            tenant,
+            &gateway.private_key,
+            gateway.relays.clone(),
+        )?;
+    }
+
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
     // kill switch is off — nothing is bound, published, or spawned, so the
     // relay behaves byte-identically to a build without the mesh. When

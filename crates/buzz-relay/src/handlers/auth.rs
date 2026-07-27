@@ -11,12 +11,12 @@
 
 use std::sync::Arc;
 
-use axum::extract::ws::Message as WsMessage;
 use tracing::{debug, info, warn};
 
 use crate::connection::{AuthState, ConnectionState};
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
+use crate::transport::RelayFrame;
 
 /// Extract a NIP-OA `auth` tag from a verified AUTH event and serialize it as
 /// the JSON-array string that [`buzz_sdk::nip_oa::verify_auth_tag`] expects.
@@ -175,9 +175,11 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     // which uses the data channel and would race the cancel), so
                     // the send loop drains it ahead of the Close it emits on
                     // cancel. Then cancel to close the socket immediately.
-                    let _ = conn.ctrl_tx.try_send(WsMessage::Text(
-                        RelayMessage::ok(&event_id_hex, false, deny_reason).into(),
-                    ));
+                    let _ = conn.ctrl_tx.try_send(RelayFrame::Text(RelayMessage::ok(
+                        &event_id_hex,
+                        false,
+                        deny_reason,
+                    )));
                     conn.cancel.cancel();
                     return;
                 }

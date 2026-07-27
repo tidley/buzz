@@ -13,8 +13,10 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import '../auth/auth.dart';
 import 'nostr_models.dart';
 import 'relay_client.dart';
+import 'fips_relay_transport.dart';
 import 'relay_provider.dart';
 import 'relay_socket.dart';
+import 'relay_transport.dart';
 
 enum SessionStatus { disconnected, connecting, connected, reconnecting }
 
@@ -72,17 +74,74 @@ typedef RelaySocketFactory =
       required void Function(List<dynamic> message) onMessage,
       required void Function() onConnected,
       required void Function(Object? error) onDisconnected,
+      required RelayTransportFactory transportFactory,
     });
+
+typedef RelayTransportFactorySelector =
+    RelayTransportFactory Function(RelayConfig config);
+
+typedef Nip17TransportFactory =
+    RelayTransportFactory Function(
+      String nsec,
+      String gatewayPubkey,
+      List<Uri> publicRelayUrls,
+    );
+
+RelayTransportFactory relayTransportFactoryFor(
+  RelayConfig config, {
+  Nip17TransportFactory? nip17TransportFactory,
+  FipsBridgeFactory fipsBridgeFactory = FfiFipsBridge.load,
+  bool Function()? isAndroid,
+}) {
+  if (!config.usesNip17) {
+    if (config.preferFips &&
+        Uri.parse(config.wsUrl).queryParameters.containsKey('fipsPeer')) {
+      final fipsFactory = FipsRelayTransport.configuredIfAvailable(
+        bridgeFactory: fipsBridgeFactory,
+        isAndroid: isAndroid,
+      );
+      if (fipsFactory != null) return fipsFactory;
+    }
+    return WebSocketRelayTransport.connect;
+  }
+
+  final nsec = config.nsec;
+  final gatewayPubkey = config.nip17GatewayPubkey;
+  if (nsec == null ||
+      gatewayPubkey == null ||
+      config.nip17PublicRelayUrls.isEmpty) {
+    throw StateError('Incomplete NIP-17 relay configuration');
+  }
+  return (nip17TransportFactory ?? _configuredNip17Transport)(
+    nsec,
+    gatewayPubkey,
+    config.nip17PublicRelayUrls.map(Uri.parse).toList(),
+  );
+}
+
+RelayTransportFactory _configuredNip17Transport(
+  String nsec,
+  String gatewayPubkey,
+  List<Uri> publicRelayUrls,
+) => Nip17RelayTransport.configured(
+  nsec: nsec,
+  gatewayPubkey: gatewayPubkey,
+  publicRelayUrls: publicRelayUrls,
+);
 
 class RelaySessionNotifier extends Notifier<SessionState> {
   RelaySessionNotifier({
     http.Client? httpClient,
     RelaySocketFactory socketFactory = RelaySocket.new,
+    RelayTransportFactorySelector transportFactorySelector =
+        relayTransportFactoryFor,
   }) : _httpClient = httpClient,
-       _socketFactory = socketFactory;
+       _socketFactory = socketFactory,
+       _transportFactorySelector = transportFactorySelector;
 
   final http.Client? _httpClient;
   final RelaySocketFactory _socketFactory;
+  final RelayTransportFactorySelector _transportFactorySelector;
 
   static const _baseReconnectDelayMs = 1000;
   static const _maxReconnectDelayMs = 30000;
@@ -366,6 +425,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
       },
       onConnected: () => _handleConnected(generation),
       onDisconnected: (error) => _handleDisconnected(generation, error),
+      transportFactory: _transportFactorySelector(config),
     );
     _socket = socket;
 
