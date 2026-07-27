@@ -216,8 +216,15 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let playback_speed = state.tts_playback_speed.clone();
     let constructed = tokio::task::spawn_blocking(move || {
-        tts::TtsPipeline::new(model_dir, tts_active, tts_cancel, output_device)
+        tts::TtsPipeline::new(
+            model_dir,
+            tts_active,
+            tts_cancel,
+            output_device,
+            playback_speed,
+        )
     })
     .await;
     let pipeline = match constructed {

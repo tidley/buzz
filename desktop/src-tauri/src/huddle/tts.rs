@@ -46,6 +46,7 @@ use std::{
     time::Duration,
 };
 
+use super::playback_speed::{PlaybackSpeedControl, PlaybackSpeedProcessor};
 use super::pocket::{load_text_to_speech, load_voice_style, SAMPLE_RATE, VOICE_FILE_EXT};
 use super::preprocessing::{preprocess_for_tts, split_sentences};
 
@@ -156,9 +157,17 @@ impl TtsPipeline {
         tts_active: Arc<AtomicBool>,
         cancel: Arc<AtomicBool>,
         output_device: Option<String>,
+        playback_speed: PlaybackSpeedControl,
     ) -> Result<Self, String> {
         use super::pocket::DEFAULT_VOICE;
-        Self::new_with_voice(model_dir, tts_active, cancel, DEFAULT_VOICE, output_device)
+        Self::new_with_voice(
+            model_dir,
+            tts_active,
+            cancel,
+            DEFAULT_VOICE,
+            output_device,
+            playback_speed,
+        )
     }
 
     /// Spawn the TTS pipeline thread with a specific voice name. Today only the
@@ -170,6 +179,7 @@ impl TtsPipeline {
         cancel: Arc<AtomicBool>,
         voice: &str,
         output_device: Option<String>,
+        playback_speed: PlaybackSpeedControl,
     ) -> Result<Self, String> {
         let (text_tx, text_rx) = mpsc::sync_channel::<String>(TEXT_QUEUE_DEPTH);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -184,15 +194,16 @@ impl TtsPipeline {
         let handle = thread::Builder::new()
             .name("tts-worker".into())
             .spawn(move || {
-                tts_worker(
-                    model_dir_worker,
+                let config = TtsWorkerConfig {
+                    model_dir: model_dir_worker,
                     voice_name,
-                    text_rx,
-                    tts_active_worker,
-                    shutdown_worker,
-                    cancel_worker,
+                    tts_active: tts_active_worker,
+                    shutdown: shutdown_worker,
+                    cancel: cancel_worker,
                     output_device,
-                )
+                    playback_speed,
+                };
+                tts_worker(config, text_rx)
             })
             .map_err(|e| format!("failed to spawn tts-worker thread: {e}"))?;
 
@@ -242,15 +253,26 @@ impl Drop for TtsPipeline {
 
 // ── Worker thread ─────────────────────────────────────────────────────────────
 
-fn tts_worker(
+struct TtsWorkerConfig {
     model_dir: PathBuf,
     voice_name: String,
-    text_rx: mpsc::Receiver<String>,
     tts_active: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     output_device: Option<String>,
-) {
+    playback_speed: PlaybackSpeedControl,
+}
+
+fn tts_worker(config: TtsWorkerConfig, text_rx: mpsc::Receiver<String>) {
+    let TtsWorkerConfig {
+        model_dir,
+        voice_name,
+        tts_active,
+        shutdown,
+        cancel,
+        output_device,
+        playback_speed,
+    } = config;
     // ── 1. Initialise TTS engine ──────────────────────────────────────────────
     let model_dir_str = model_dir.to_string_lossy().to_string();
 
@@ -536,6 +558,19 @@ fn tts_worker(
                     // every chunk a quiet device warm-up window.
                     let buf =
                         build_sentence_append_buffer(&mut first_append, audio, silence_buf_len);
+                    let speed = playback_speed.get();
+                    let buf = match PlaybackSpeedProcessor::new(speed, SAMPLE_RATE)
+                        .and_then(|mut processor| processor.process_complete_chunk(&buf))
+                    {
+                        Ok(processed) => processed,
+                        Err(error) => {
+                            eprintln!(
+                                "buzz-desktop: TTS playback-speed processing failed at {speed:.2}x: \
+                                 {error}; using 1x playback"
+                            );
+                            buf
+                        }
+                    };
 
                     // Check-and-append under `player_ops`, serialized with
                     // the monitor: a barge-in may have arrived during
