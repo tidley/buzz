@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use tauri::State;
 
 use crate::app_state::AppState;
@@ -52,8 +50,7 @@ pub async fn set_huddle_transcription_enabled(
         if enabled {
             (ephemeral_channel_id, None)
         } else {
-            hs.session_generation.fetch_add(1, Ordering::Release);
-            hs.stt_starting.store(false, Ordering::Release);
+            hs.invalidate_transcription_pipeline();
             (ephemeral_channel_id, hs.stt_pipeline.take())
         }
     };
