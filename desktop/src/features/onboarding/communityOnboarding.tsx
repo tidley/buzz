@@ -4,6 +4,7 @@ import {
 } from "@/features/communities/communityStorage";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 import type { Profile } from "@/shared/api/types";
+import type { Nip17CommunityConfig } from "@/shared/api/nip17Transport";
 
 const STORAGE_KEY = "buzz-community-onboarding-transaction.v1";
 
@@ -40,6 +41,9 @@ export type CommunityOnboardingTransaction = {
   communityName: string;
   token?: string;
   reposDir?: string;
+  relayTransport?: Nip17CommunityConfig["relayTransport"];
+  nip17GatewayPubkey?: string;
+  nip17PublicRelayUrls?: string[];
   /**
    * Join-policy acceptance receipt minted before the claim (bound to the
    * invite code). Forwarded to `claimInvite` so relays with a configured
@@ -66,6 +70,9 @@ export type CommunityOnboardingTransactionPatch = Partial<
     | "previousCommunityId"
     | "addedCommunity"
     | "communityName"
+    | "relayTransport"
+    | "nip17GatewayPubkey"
+    | "nip17PublicRelayUrls"
     | "error"
     | "acknowledged"
   >
@@ -80,6 +87,9 @@ export type StartCommunityOnboardingInput = {
   token?: string;
   reposDir?: string;
   policyReceipt?: string;
+  relayTransport?: Nip17CommunityConfig["relayTransport"];
+  nip17GatewayPubkey?: string;
+  nip17PublicRelayUrls?: string[];
 };
 
 function canonicalRelayUrl(rawRelayUrl: string) {
@@ -184,6 +194,9 @@ export function startCommunityOnboarding(
     communityName: input.communityName?.trim() || deriveCommunityName(relayUrl),
     token: input.token?.trim() || undefined,
     reposDir: input.reposDir,
+    relayTransport: input.relayTransport,
+    nip17GatewayPubkey: input.nip17GatewayPubkey,
+    nip17PublicRelayUrls: input.nip17PublicRelayUrls,
     policyReceipt: input.policyReceipt,
     createdAt: timestamp,
     updatedAt: timestamp,

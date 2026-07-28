@@ -5,6 +5,7 @@ import { HostedCommunityOnboarding } from "@/features/communities/ui/HostedCommu
 import { useCommunityOnboarding } from "@/features/onboarding/communityOnboarding";
 import { InviteRedeemForm } from "@/features/onboarding/ui/InviteRedeemForm";
 import { OnboardingChrome } from "@/features/onboarding/ui/OnboardingChrome";
+import { normalizeNip17Config } from "@/shared/api/nip17Transport";
 import {
   OnboardingFooter,
   OnboardingFooterProvider,
@@ -19,9 +20,16 @@ import { pubkeyToNpub } from "@/shared/lib/nostrUtils";
 import { useSystemColorScheme } from "@/shared/theme/useSystemColorScheme";
 import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
+import { Input } from "@/shared/ui/input";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 
-type WelcomeSetupPage = "welcome" | "existing" | "join" | "member" | "owned";
+type WelcomeSetupPage =
+  | "welcome"
+  | "existing"
+  | "join"
+  | "member"
+  | "nip17"
+  | "owned";
 type WelcomeTransitionMode = "initial" | OnboardingTransitionDirection;
 
 type WelcomeSetupProps = {
@@ -32,6 +40,7 @@ type WelcomeSetupProps = {
 
 const COMMUNITY_OPTION_CARD_CLASS =
   "w-full max-w-[320px] items-center px-6 py-4 text-center text-sm font-normal leading-6 text-foreground [--buzz-card-textured-min-height:88px] transition-[filter] duration-150 ease-out hover:brightness-[0.98] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-foreground/35";
+const NIP17_RELAY_IDENTITY = "wss://nip17.buzz.invalid";
 
 export function WelcomeSetup({
   initialPage = "welcome",
@@ -46,6 +55,10 @@ export function WelcomeSetup({
   // behind the modal never changes out from under the user.
   const [isHostedSignInOpen, setIsHostedSignInOpen] = React.useState(false);
   const [copiedNpub, setCopiedNpub] = React.useState(false);
+  const [nip17Name, setNip17Name] = React.useState("Private community");
+  const [nip17GatewayPubkey, setNip17GatewayPubkey] = React.useState("");
+  const [nip17PublicRelayUrls, setNip17PublicRelayUrls] = React.useState("");
+  const [nip17Error, setNip17Error] = React.useState<string | null>(null);
   const communityOnboarding = useCommunityOnboarding();
   const identityQuery = useIdentityQuery();
   const systemColorScheme = useSystemColorScheme();
@@ -91,6 +104,31 @@ export function WelcomeSetup({
     },
     [communityOnboarding, page],
   );
+  const startNip17Connection = React.useCallback(() => {
+    const transport = normalizeNip17Config({
+      relayTransport: "nip17",
+      nip17GatewayPubkey: nip17GatewayPubkey.trim(),
+      nip17PublicRelayUrls: nip17PublicRelayUrls.split(/\s+/).filter(Boolean),
+    });
+    if (transport.relayTransport !== "nip17") {
+      setNip17Error(
+        "Enter a 64-character gateway pubkey and at least one public relay URL.",
+      );
+      return;
+    }
+    communityOnboarding.start({
+      source: "first-community",
+      firstCommunityPage: "join",
+      relayUrl: NIP17_RELAY_IDENTITY,
+      communityName: nip17Name.trim() || "Private community",
+      ...transport,
+    });
+  }, [
+    communityOnboarding,
+    nip17GatewayPubkey,
+    nip17Name,
+    nip17PublicRelayUrls,
+  ]);
 
   const transitionDirection =
     transitionMode === "backward" ? "backward" : "forward";
@@ -135,6 +173,19 @@ export function WelcomeSetup({
                     type="button"
                   >
                     Join a community
+                  </button>
+                </Card>
+                <Card
+                  asChild
+                  className={COMMUNITY_OPTION_CARD_CLASS}
+                  variant="textured"
+                >
+                  <button
+                    data-testid="community-choice-nip17"
+                    onClick={() => showPage("nip17")}
+                    type="button"
+                  >
+                    Connect privately
                   </button>
                 </Card>
                 <Card
@@ -223,6 +274,66 @@ export function WelcomeSetup({
                 <Button
                   className="h-9 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
                   data-testid="existing-back"
+                  onClick={() => showPage("welcome")}
+                  type="button"
+                  variant="ghost"
+                >
+                  Back
+                </Button>
+              </OnboardingFooter>
+            </OnboardingSlideTransition>
+          ) : page === "nip17" ? (
+            <OnboardingSlideTransition
+              className="flex w-full flex-col items-center text-center"
+              direction={transitionDirection}
+              transitionKey={`nip17-${transitionDirection}`}
+            >
+              <div className="w-full max-w-[620px]">
+                <h1 className="text-title font-normal">Connect privately</h1>
+                <p className="mt-3 text-sm leading-6 text-foreground/80">
+                  Connect through a NIP-17 gateway on public Nostr relays. No
+                  direct relay URL is required.
+                </p>
+              </div>
+              <form
+                className="mt-12 flex w-full max-w-[520px] flex-col gap-3 text-left"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  startNip17Connection();
+                }}
+              >
+                <Input
+                  onChange={(event) => setNip17Name(event.target.value)}
+                  placeholder="Community name"
+                  value={nip17Name}
+                />
+                <Input
+                  onChange={(event) => {
+                    setNip17GatewayPubkey(event.target.value);
+                    setNip17Error(null);
+                  }}
+                  placeholder="Gateway pubkey (64 hex characters)"
+                  value={nip17GatewayPubkey}
+                />
+                <textarea
+                  className="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  onChange={(event) => {
+                    setNip17PublicRelayUrls(event.target.value);
+                    setNip17Error(null);
+                  }}
+                  placeholder={"wss://relay.example\nwss://relay2.example"}
+                  value={nip17PublicRelayUrls}
+                />
+                {nip17Error ? (
+                  <p className="text-sm text-destructive">{nip17Error}</p>
+                ) : null}
+                <Button className="w-full" type="submit">
+                  Connect privately
+                </Button>
+              </form>
+              <OnboardingFooter>
+                <Button
+                  className="h-9 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
                   onClick={() => showPage("welcome")}
                   type="button"
                   variant="ghost"

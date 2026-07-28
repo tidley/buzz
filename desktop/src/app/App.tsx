@@ -380,6 +380,9 @@ function CommunityApp({
       relayUrl: transaction.relayUrl,
       token: transaction.token,
       reposDir: transaction.reposDir,
+      relayTransport: transaction.relayTransport,
+      nip17GatewayPubkey: transaction.nip17GatewayPubkey,
+      nip17PublicRelayUrls: transaction.nip17PublicRelayUrls,
       pubkey: currentPubkey ?? undefined,
       addedAt: new Date().toISOString(),
     });

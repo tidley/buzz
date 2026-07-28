@@ -71,10 +71,8 @@ pnpm -C desktop tauri build
 
 For development instead of a packaged app, use `pnpm -C desktop tauri dev`.
 
-2. In the app, create or edit a community. Set its Relay URL to
-`ws://localhost:3000`; this is an identity value for the local test tenant.
-
-3. Enable **Private relay transport**, then enter:
+2. On the first screen, select **Connect privately**. This does not need a
+direct relay URL. Enter a community name, then enter:
 
 ```text
 Gateway pubkey: <public key from the first generated key>
@@ -84,17 +82,10 @@ wss://nos.lol
 wss://nostr.mom
 ```
 
-4. Save, join or create a channel, and send a message. Confirm the server log
+3. Select **Connect privately**, then join or create a channel and send a
+message. Confirm the server log
 receives NIP-17 gateway traffic and the message appears in the client.
 
-The laptop does not need a route to this machine's `:3000` port for this test.
-If the public relays block WebSockets on the laptop network, use reachable
-public relays in both server and client configuration.
-
-## Direct Fallback
-
-For direct-WebSocket troubleshooting on the same LAN, use the server's LAN IP
-from `hostname -I` as the community Relay URL, for example
-`ws://<server-lan-ip>:3000`, and turn off Private relay transport. This is
-separate from the NIP-17 test; restore the NIP-17 community settings before
-resuming it.
+The laptop never needs a route to this machine's `:3000` port. If the public
+relays block WebSockets on the laptop network, use reachable public relays in
+both server and client configuration.
