@@ -17,6 +17,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const SEND_QUEUE_CAPACITY: usize = 64;
+const NIP17_SESSION_TAG_PREFIX: &str = "buzz-nip17-session:";
 
 pub(crate) fn install_crypto_provider() {
     // Dependencies enable both rustls providers; choose one before TLS setup.
@@ -243,8 +244,17 @@ async fn open_nip17_connection(
             _ = connect_cancel.cancelled() => return Err("WebSocket connection cancelled".to_string()),
             result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&url)) => result,
         };
-        if let Ok(Ok((socket, _))) = result {
-            sockets.push(socket);
+        match result {
+            Ok(Ok((socket, _))) => {
+                eprintln!("buzz-desktop: NIP-17 connected to public relay {url}");
+                sockets.push(socket);
+            }
+            Ok(Err(error)) => {
+                eprintln!("buzz-desktop: NIP-17 public relay {url} rejected connection: {error}");
+            }
+            Err(_) => {
+                eprintln!("buzz-desktop: NIP-17 public relay {url} connection timed out");
+            }
         }
     }
     if sockets.is_empty() {
@@ -300,6 +310,7 @@ async fn run_nip17_connection(
     keys: Keys,
     gateway: PublicKey,
 ) {
+    let session_id = uuid::Uuid::new_v4().simple().to_string();
     let (incoming_tx, mut incoming_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
     let mut relay_senders = Vec::new();
     for socket in sockets {
@@ -313,7 +324,10 @@ async fn run_nip17_connection(
                 tokio::select! {
                     _ = child_cancel.cancelled() => break,
                     message = relay_rx.recv() => match message {
-                        Some(message) => if writer.send(Message::Text(message.into())).await.is_err() { break },
+                        Some(message) => if let Err(error) = writer.send(Message::Text(message.into())).await {
+                            eprintln!("buzz-desktop: NIP-17 public relay write failed: {error}");
+                            break;
+                        },
                         None => break,
                     },
                     message = reader.next() => match message {
@@ -333,15 +347,25 @@ async fn run_nip17_connection(
     }
     // A store-and-forward gateway has no connection until it receives a relay
     // frame. Send a harmless CLOSE to prompt its initial NIP-42 challenge.
-    if let Ok(event) =
-        wrap_nip17_frame(&keys, &gateway, "[\"CLOSE\",\"__buzz_nip17_bootstrap\"]").await
+    if let Ok(event) = wrap_nip17_frame(
+        &keys,
+        &gateway,
+        &session_id,
+        "[\"CLOSE\",\"__buzz_nip17_bootstrap\"]",
+    )
+    .await
     {
         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&event) {
             let bootstrap = serde_json::json!(["EVENT", event]).to_string();
             for sender in &relay_senders {
                 let _ = sender.send(bootstrap.clone()).await;
             }
+            eprintln!("buzz-desktop: NIP-17 queued bootstrap envelope for public relays");
+        } else {
+            eprintln!("buzz-desktop: NIP-17 could not serialize bootstrap envelope");
         }
+    } else {
+        eprintln!("buzz-desktop: NIP-17 could not create bootstrap envelope");
     }
 
     loop {
@@ -350,7 +374,7 @@ async fn run_nip17_connection(
             request = receiver.recv() => {
                 let Some(request) = request else { break };
                 let result = match request.message {
-                    Message::Text(frame) => wrap_nip17_frame(&keys, &gateway, frame.as_str()).await,
+                    Message::Text(frame) => wrap_nip17_frame(&keys, &gateway, &session_id, frame.as_str()).await,
                     _ => Err("NIP-17 relay transport only supports text frames".to_string()),
                 };
                 match result {
@@ -373,7 +397,15 @@ async fn run_nip17_connection(
                 }
             }
             Some(frame) = incoming_rx.recv() => {
-                if let Some(frame) = unwrap_nip17_frame(&keys, &gateway, &frame).await {
+                if let Ok(message) = serde_json::from_str::<serde_json::Value>(&frame) {
+                    if message.get(0).and_then(|value| value.as_str()) == Some("OK") {
+                        let accepted = message.get(2).and_then(|value| value.as_bool()).unwrap_or(false);
+                        let detail = message.get(3).and_then(|value| value.as_str()).unwrap_or("");
+                        eprintln!("buzz-desktop: NIP-17 public relay publish accepted={accepted}: {detail}");
+                    }
+                }
+                if let Some(frame) = unwrap_nip17_frame(&keys, &gateway, &session_id, &frame).await {
+                    eprintln!("buzz-desktop: NIP-17 received gateway response");
                     if let Ok(value) = serde_json::to_value(OutboundMessage::Text(frame)) { let _ = on_message.send(value); }
                 }
             }
@@ -382,10 +414,20 @@ async fn run_nip17_connection(
     manager.remove(id).await;
 }
 
-async fn wrap_nip17_frame(keys: &Keys, gateway: &PublicKey, frame: &str) -> Result<String, String> {
+async fn wrap_nip17_frame(
+    keys: &Keys,
+    gateway: &PublicKey,
+    session_id: &str,
+    frame: &str,
+) -> Result<String, String> {
     let tag = Tag::parse(vec!["p", &gateway.to_hex()]).map_err(|error| error.to_string())?;
+    let session = Tag::parse(vec![
+        "t",
+        &format!("{NIP17_SESSION_TAG_PREFIX}{session_id}"),
+    ])
+    .map_err(|error| error.to_string())?;
     let rumor = EventBuilder::new(Kind::from(14_u16), frame)
-        .tags([tag])
+        .tags([tag, session])
         .build(keys.public_key());
     EventBuilder::gift_wrap(keys, gateway, rumor, [])
         .await
@@ -393,7 +435,12 @@ async fn wrap_nip17_frame(keys: &Keys, gateway: &PublicKey, frame: &str) -> Resu
         .map(|event| event.as_json())
 }
 
-async fn unwrap_nip17_frame(keys: &Keys, gateway: &PublicKey, frame: &str) -> Option<String> {
+async fn unwrap_nip17_frame(
+    keys: &Keys,
+    gateway: &PublicKey,
+    session_id: &str,
+    frame: &str,
+) -> Option<String> {
     let message: serde_json::Value = serde_json::from_str(frame).ok()?;
     let event: Event = serde_json::from_value(message.get(2)?.clone()).ok()?;
     let gift: serde_json::Value = serde_json::to_value(&event).ok()?;
@@ -405,7 +452,20 @@ async fn unwrap_nip17_frame(keys: &Keys, gateway: &PublicKey, frame: &str) -> Op
         return None;
     }
     let rumor_value = serde_json::to_value(&rumor.rumor).ok()?;
-    has_recipient(&rumor_value, &keys.public_key().to_hex()).then_some(rumor.rumor.content)
+    (has_recipient(&rumor_value, &keys.public_key().to_hex())
+        && has_session(&rumor_value, session_id))
+    .then_some(rumor.rumor.content)
+}
+
+fn has_session(event: &serde_json::Value, session_id: &str) -> bool {
+    let expected = format!("{NIP17_SESSION_TAG_PREFIX}{session_id}");
+    event["tags"].as_array().is_some_and(|tags| {
+        tags.iter().any(|tag| {
+            tag.as_array().is_some_and(|tag| {
+                tag.len() >= 2 && tag[0] == "t" && tag[1].as_str() == Some(expected.as_str())
+            })
+        })
+    })
 }
 
 fn has_recipient(event: &serde_json::Value, recipient: &str) -> bool {
@@ -582,10 +642,16 @@ mod tests {
         let recipient = Keys::generate();
         let gateway = Keys::generate();
         let attacker = Keys::generate();
+        let session_id = "current-session";
         let recipient_tag = Tag::parse(vec!["p", &recipient.public_key().to_hex()]).unwrap();
+        let session_tag = Tag::parse(vec![
+            "t",
+            &format!("{NIP17_SESSION_TAG_PREFIX}{session_id}"),
+        ])
+        .unwrap();
 
         let response = EventBuilder::new(Kind::from(14_u16), "[\"NOTICE\",\"gateway\"]")
-            .tags([recipient_tag.clone()])
+            .tags([recipient_tag.clone(), session_tag])
             .build(gateway.public_key());
         let gateway_wrap = EventBuilder::gift_wrap(&gateway, &recipient.public_key(), response, [])
             .await
@@ -601,11 +667,23 @@ mod tests {
         let gateway_frame = serde_json::json!(["EVENT", "gift-wraps", gateway_wrap]).to_string();
         let attacker_frame = serde_json::json!(["EVENT", "gift-wraps", attacker_wrap]).to_string();
         assert_eq!(
-            unwrap_nip17_frame(&recipient, &gateway.public_key(), &gateway_frame).await,
+            unwrap_nip17_frame(
+                &recipient,
+                &gateway.public_key(),
+                session_id,
+                &gateway_frame
+            )
+            .await,
             Some("[\"NOTICE\",\"gateway\"]".to_string())
         );
         assert_eq!(
-            unwrap_nip17_frame(&recipient, &gateway.public_key(), &attacker_frame).await,
+            unwrap_nip17_frame(
+                &recipient,
+                &gateway.public_key(),
+                session_id,
+                &attacker_frame
+            )
+            .await,
             None
         );
     }
@@ -618,6 +696,7 @@ mod tests {
         let wrapped = wrap_nip17_frame(
             &client,
             &gateway.public_key(),
+            "test-session",
             "[\"REQ\",\"sub\",{\"kinds\":[9]}]",
         )
         .await

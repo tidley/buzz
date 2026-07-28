@@ -12,6 +12,9 @@ import type {
   UpdateChannelInput,
 } from "@/shared/api/types";
 import { invokeTauri } from "@/shared/api/tauri";
+import { relayClient } from "@/shared/api/relayClient";
+import { usesNip17Transport } from "@/shared/api/relayTransportState";
+import { getIdentity } from "@/shared/api/tauriIdentity";
 
 export type RawChannel = {
   id: string;
@@ -106,8 +109,111 @@ function fromRawChannelMember(member: RawChannelMember): ChannelMember {
 }
 
 export async function getChannels(): Promise<Channel[]> {
+  if (usesNip17Transport()) {
+    return getNip17Channels();
+  }
   const channels = await invokeTauri<RawChannel[]>("get_channels");
   return channels.map(fromRawChannel);
+}
+
+async function getNip17Channels(): Promise<Channel[]> {
+  const { pubkey } = await getIdentity();
+  const memberEvents = await relayClient.fetchEvents({
+    kinds: [39002],
+    "#p": [pubkey],
+    limit: 500,
+  });
+  const membersByChannel = new Map<string, string[]>();
+  for (const event of memberEvents) {
+    const channelId = tagValue(event.tags, "d");
+    if (!channelId) continue;
+    membersByChannel.set(
+      channelId,
+      event.tags
+        .filter(([name, value]) => name === "p" && value)
+        .map(([, value]) => value),
+    );
+  }
+  const channelIds = [...membersByChannel.keys()];
+  if (channelIds.length === 0) return [];
+
+  const metadata = await relayClient.fetchEvents({
+    kinds: [39000],
+    "#d": channelIds,
+    limit: channelIds.length,
+  });
+  const participantPubkeys = [
+    ...new Set(
+      metadata.flatMap((event) =>
+        event.tags
+          .filter(([tag, value]) => tag === "p" && value)
+          .map(([, value]) => value),
+      ),
+    ),
+  ];
+  const profiles = await relayClient.fetchEvents({
+    kinds: [0],
+    authors: participantPubkeys,
+    limit: participantPubkeys.length,
+  });
+  const profileNames = new Map(
+    profiles.flatMap((event) => {
+      try {
+        const profile = JSON.parse(event.content) as {
+          display_name?: string;
+          name?: string;
+        };
+        const name = profile.display_name?.trim() || profile.name?.trim();
+        return name ? [[event.pubkey.toLowerCase(), name] as const] : [];
+      } catch {
+        return [];
+      }
+    }),
+  );
+  return metadata.flatMap((event) => {
+    const id = tagValue(event.tags, "d");
+    const name = tagValue(event.tags, "name");
+    if (!id || !name || !membersByChannel.has(id)) return [];
+
+    const participantPubkeys = event.tags
+      .filter(([tag, value]) => tag === "p" && value)
+      .map(([, value]) => value);
+    const participants = participantPubkeys.map(
+      (participant) =>
+        profileNames.get(participant.toLowerCase()) ?? participant,
+    );
+    const members = membersByChannel.get(id) ?? [];
+    return [
+      fromRawChannel({
+        id,
+        name,
+        channel_type: (tagValue(event.tags, "t") ?? "stream") as ChannelType,
+        visibility: hasTag(event.tags, "private") ? "private" : "open",
+        description: tagValue(event.tags, "about") ?? "",
+        topic: tagValue(event.tags, "topic"),
+        purpose: tagValue(event.tags, "purpose"),
+        member_count: members.length,
+        member_pubkeys: members,
+        last_message_at: null,
+        archived_at: hasTag(event.tags, "archived")
+          ? new Date(event.created_at * 1_000).toISOString()
+          : null,
+        participants,
+        participant_pubkeys: participantPubkeys,
+        is_member: true,
+        ttl_seconds: null,
+        ttl_deadline: null,
+      }),
+    ];
+  });
+}
+
+function tagValue(tags: string[][], name: string): string | null {
+  return tags.find(([tag, value]) => tag === name && value)?.[1] ?? null;
+}
+
+function hasTag(tags: string[][], name: string): boolean {
+  return tags.some(([tag]) => tag === name);
 }
 
 export async function createChannel(

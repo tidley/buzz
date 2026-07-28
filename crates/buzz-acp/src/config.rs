@@ -13,6 +13,8 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
+use crate::remote_config::RemoteConfig;
+
 use crate::filter::SubscriptionRule;
 
 /// Default idle timeout (seconds) when neither `--idle-timeout` nor the
@@ -91,7 +93,18 @@ pub enum MultipleEventHandling {
 /// - `allowlist`  — owner + explicit pubkey list (`--respond-to-allowlist`).
 /// - `anyone`     — all events forwarded (no author filtering).
 /// - `nobody`     — all events dropped (proactive/heartbeat-only mode).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum RespondTo {
     #[default]
     OwnerOnly,
@@ -341,6 +354,10 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_CONFIG", default_value = "./buzz-acp.toml")]
     pub config: PathBuf,
 
+    /// JSON file updated by owner-authorized DM configuration commands.
+    #[arg(long, env = "BUZZ_ACP_REMOTE_CONFIG")]
+    pub remote_config: Option<PathBuf>,
+
     #[arg(long, env = "BUZZ_ACP_DEDUP", default_value = "queue", value_enum)]
     pub dedup: DedupMode,
 
@@ -380,6 +397,10 @@ pub struct CliArgs {
     /// Disable typing indicators while agent is processing.
     #[arg(long, env = "BUZZ_ACP_NO_TYPING")]
     pub no_typing: bool,
+
+    /// Disable automatic queued and working message reactions.
+    #[arg(long, env = "BUZZ_ACP_NO_REACTIONS")]
+    pub no_reactions: bool,
 
     /// Enable NIP-AE agent core memory injection.
     ///
@@ -516,11 +537,15 @@ pub struct Config {
     pub channels_override: Option<Vec<String>>,
     pub no_mention_filter: bool,
     pub config_path: PathBuf,
+    /// Optional owner-controlled configuration file, applied on process restart.
+    pub remote_config_path: Option<PathBuf>,
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
+    /// Whether queued and active agent turns publish message reactions.
+    pub reactions_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
     /// the harness skips the per-session core engram fetch and renders no
     /// `[Agent Memory — core]` section. On by default; disabled via the
@@ -809,6 +834,34 @@ impl Config {
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
+        if let Some(path) = args.remote_config.as_deref() {
+            if let Some(remote) = RemoteConfig::load(path)? {
+                if let Some(value) = remote.system_prompt {
+                    args.system_prompt = Some(value);
+                }
+                if let Some(value) = remote.model {
+                    args.model = Some(value);
+                }
+                if let Some(value) = remote.respond_to {
+                    args.respond_to = value;
+                }
+                if let Some(value) = remote.respond_to_allowlist {
+                    args.respond_to_allowlist = Some(value);
+                }
+                if let Some(value) = remote.channels {
+                    args.channels = Some(value);
+                }
+                if let Some(value) = remote.agents {
+                    args.agents = value;
+                }
+                if let Some(value) = remote.idle_timeout_secs {
+                    args.idle_timeout = Some(value);
+                }
+                if let Some(value) = remote.max_turn_duration_secs {
+                    args.max_turn_duration = value;
+                }
+            }
+        }
         let keys = Keys::parse(&args.private_key)?;
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
@@ -1057,10 +1110,12 @@ impl Config {
             channels_override: args.channels,
             no_mention_filter: args.no_mention_filter,
             config_path: args.config,
+            remote_config_path: args.remote_config,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
+            reactions_enabled: !args.no_reactions,
             memory_enabled: args.memory && !args.no_memory,
             model,
             session_title: args
@@ -1430,10 +1485,12 @@ mod tests {
             channels_override: None,
             no_mention_filter: false,
             config_path: PathBuf::from("./buzz-acp.toml"),
+            remote_config_path: None,
             context_message_limit: 12,
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            reactions_enabled: true,
             memory_enabled: true,
             model: None,
             session_title: None,
@@ -2122,6 +2179,34 @@ channels = "ALL"
         let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", &key, "--lazy-pool=true"]);
         assert!(args.is_err(), "bool flags do not take an explicit value");
         assert!(CliArgs::parse_from(["buzz-acp", "--private-key", &key, "--lazy-pool"]).lazy_pool);
+    }
+
+    #[test]
+    fn remote_config_overrides_restart_applied_settings() {
+        let path =
+            std::env::temp_dir().join(format!("buzz-acp-remote-{}.json", uuid::Uuid::new_v4()));
+        crate::remote_config::RemoteConfig {
+            model: Some("gpt-5".to_string()),
+            agents: Some(2),
+            ..Default::default()
+        }
+        .save(&path)
+        .expect("save remote config");
+
+        let key = "1".repeat(64);
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--remote-config",
+            path.to_str().expect("UTF-8 temp path"),
+        ])
+        .expect("parse arguments");
+        let config = Config::from_args(args).expect("load remote config");
+        std::fs::remove_file(path).expect("remove remote config");
+
+        assert_eq!(config.model.as_deref(), Some("gpt-5"));
+        assert_eq!(config.agents, 2);
     }
 
     #[test]

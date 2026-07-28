@@ -60,6 +60,9 @@ pub struct ConnectionState {
     pub tenant: TenantContext,
     /// Remote socket address of the client.
     pub remote_addr: SocketAddr,
+    /// Optional relay URL expected in a NIP-42 AUTH event for a virtual transport.
+    /// Direct WebSocket connections always derive this from their tenant host.
+    pub auth_relay_url: Option<String>,
     /// Current NIP-42 authentication state.
     pub auth_state: RwLock<AuthState>,
     /// Active subscriptions keyed by subscription ID.
@@ -143,6 +146,19 @@ impl VirtualConnection {
         addr: SocketAddr,
         tenant: TenantContext,
     ) -> Result<Self, VirtualConnectionError> {
+        Self::open_with_auth_relay_url(state, addr, tenant, None).await
+    }
+
+    /// Opens a virtual session with an explicit NIP-42 relay identity.
+    ///
+    /// Tunnel transports use this when their client-visible relay URL is not a
+    /// network endpoint. The caller owns the identity and must keep it stable.
+    pub async fn open_with_auth_relay_url(
+        state: Arc<AppState>,
+        addr: SocketAddr,
+        tenant: TenantContext,
+        auth_relay_url: Option<String>,
+    ) -> Result<Self, VirtualConnectionError> {
         let permit = state
             .conn_semaphore
             .clone()
@@ -172,6 +188,7 @@ impl VirtualConnection {
             conn_id,
             tenant,
             remote_addr: addr,
+            auth_relay_url,
             auth_state: RwLock::new(AuthState::Pending {
                 challenge: challenge.clone(),
             }),
@@ -328,6 +345,7 @@ async fn handle_active_connection(
         conn_id,
         tenant,
         remote_addr: addr,
+        auth_relay_url: None,
         auth_state: RwLock::new(AuthState::Pending {
             challenge: challenge.clone(),
         }),
@@ -992,6 +1010,7 @@ mod tests {
                 "test.local",
             ),
             remote_addr: "127.0.0.1:1234".parse().expect("socket address"),
+            auth_relay_url: None,
             auth_state: RwLock::new(AuthState::Pending {
                 challenge: "test-challenge".to_string(),
             }),

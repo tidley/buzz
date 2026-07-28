@@ -9,6 +9,7 @@ mod pool;
 mod pool_lifecycle;
 mod queue;
 mod relay;
+mod remote_config;
 mod setup_mode;
 mod usage;
 
@@ -1553,6 +1554,7 @@ async fn tokio_main() -> Result<()> {
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
+        reactions_enabled: config.reactions_enabled,
         permission_mode: config.permission_mode,
         agent_keys: config.keys.clone(),
         agent_owner_pubkey: startup_owner
@@ -2030,6 +2032,28 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
+                            if let Some(remote_config_path) = config.remote_config_path.as_deref() {
+                                if kind_u32 == KIND_STREAM_MESSAGE
+                                    && buzz_event.event.content.trim_start().starts_with("!config ")
+                                    && owner_cache.get().is_some_and(|owner| {
+                                        buzz_event.event.pubkey.to_hex() == *owner
+                                    })
+                                    && is_dm_channel(buzz_event.channel_id, &ctx.channel_info).await
+                                    && event_mentions_agent(&buzz_event.event, &pubkey_hex)
+                                {
+                                    match remote_config::RemoteConfig::parse_command(&buzz_event.event.content)
+                                        .and_then(|remote| remote.save(remote_config_path))
+                                    {
+                                        Ok(()) => {
+                                            tracing::info!(channel_id = %buzz_event.channel_id, "owner updated remote ACP configuration; restarting");
+                                            let _ = shutdown_tx.send(());
+                                        }
+                                        Err(error) => tracing::warn!(channel_id = %buzz_event.channel_id, %error, "rejected remote ACP configuration"),
+                                    }
+                                    continue;
+                                }
+                            }
+
                             // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
                             let is_shutdown = is_owner_control_command(
                                 &buzz_event.event,
@@ -2207,7 +2231,7 @@ async fn tokio_main() -> Result<()> {
                             // Fire-and-forget: on rare fast-failure paths the
                             // guard's cleanup may race with this add, leaving a
                             // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
-                            if accepted {
+                            if accepted && config.reactions_enabled {
                                 let rc = ctx.rest_client.clone();
                                 let eid = event_id_hex.clone();
                                 tokio::spawn(async move {
@@ -4980,10 +5004,12 @@ mod build_mcp_servers_tests {
             channels_override: None,
             no_mention_filter: false,
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
+            remote_config_path: None,
             context_message_limit: 12,
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            reactions_enabled: true,
             memory_enabled: false,
             model: None,
             session_title: None,
@@ -5201,10 +5227,12 @@ mod error_outcome_emission_tests {
             channels_override: None,
             no_mention_filter: false,
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
+            remote_config_path: None,
             context_message_limit: 12,
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            reactions_enabled: true,
             memory_enabled: false,
             model: None,
             session_title: None,

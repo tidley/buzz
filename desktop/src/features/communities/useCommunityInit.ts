@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { relayClient } from "@/shared/api/relayClient";
+import { setRelayTransportConfig } from "@/shared/api/relayTransportState";
 import { resetRateLimitGate } from "@/shared/api/relayRateLimitGate";
 import {
   applyCommunity,
@@ -193,7 +194,7 @@ export function useCommunityInit(
       }
       hasInitializedRef.current = true;
       appliedRelayUrlRef.current = activeCommunity.relayUrl;
-      relayClient.setTransportConfig(activeCommunity);
+      setRelayTransportConfig(activeCommunity);
 
       // Apply community config to the Tauri backend.
       //

@@ -52,10 +52,8 @@ import {
 } from "@/shared/api/relayReconnectPolicy";
 import { RelayStallWatchdog } from "@/shared/api/relayStallWatchdog";
 import { closeWebSocket } from "@/shared/api/relayWebSocketClose";
-import {
-  relayTransportConfig,
-  type Nip17CommunityConfig,
-} from "@/shared/api/nip17Transport";
+import { relayTransportConfig } from "@/shared/api/nip17Transport";
+import { relayTransportConfigState } from "@/shared/api/relayTransportState";
 import { buildThreadReferenceTags } from "@/features/messages/lib/threading";
 const RECONNECT_BASE_DELAY_MS = 1_000,
   RECONNECT_MAX_DELAY_MS = 30_000,
@@ -108,10 +106,6 @@ export class RelayClient {
   private connectionGeneration = 0;
   private stabilityTimer: number | null = null;
   private visibleChannelId: string | null = null;
-  private transportConfig: Nip17CommunityConfig = { relayTransport: "direct" };
-  setTransportConfig(config: Partial<Nip17CommunityConfig>) {
-    this.transportConfig = config;
-  }
   /**
    * Sticky terminal flag. Set when `resetConnection` is called with
    * `reconnect: false` (today: auth rejection). Acts as a hard guard against
@@ -559,7 +553,7 @@ export class RelayClient {
       const wsId = await invoke<number>("plugin:websocket|connect", {
         url: this.relayUrl,
         onMessage: this.onMessageChannel,
-        config: relayTransportConfig(this.transportConfig),
+        config: relayTransportConfig(relayTransportConfigState()),
       });
       if (generation !== this.connectionGeneration) {
         void closeWebSocket(wsId, "stale connection attempt");

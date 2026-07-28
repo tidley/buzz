@@ -157,6 +157,26 @@ The gate applies to **all** inbound events — @mentions, DMs, thread replies, a
 
 Use `!cancel` to stop only the current turn; it is a no-op when the channel is idle. Use `!rotate` when you want the next turn in the channel to start from a fresh ACP session, even if the channel is currently idle.
 
+### Owner DM Configuration
+
+For supervised remote agents, set `BUZZ_ACP_REMOTE_CONFIG` to a JSON file path
+and configure the service with `Restart=always`. The registered owner can then
+send a signed Buzz DM to the agent with a `p` tag mentioning the agent:
+
+```text
+!config {"model":"gpt-5","respond_to":"owner-only","agents":2}
+```
+
+The harness accepts the command only from the agent owner, only in a DM, and
+only when the agent is explicitly mentioned. It writes the override atomically
+and exits so the supervisor reloads it. The supported fields are
+`system_prompt`, `model`, `respond_to`, `respond_to_allowlist`, `channels`,
+`agents`, `idle_timeout_secs`, and `max_turn_duration_secs`.
+
+The command rejects unknown fields. It cannot change executable paths,
+environment variables, credentials, or OpenCode configuration files; keep
+those under local operator control on the remote machine.
+
 Owner control commands must be kind:9 stream messages from the owner, must mention this agent with a `p` tag, and are consumed by the harness instead of being forwarded to the agent.
 
 > **Note:** The default mode is `owner-only`. Agents without a registered `agent_owner_pubkey` will not respond to any events until the owner is resolved. Set `--respond-to anyone` to disable the gate entirely.

@@ -77,8 +77,9 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
     // tampered, NIP-42 verification will fail before we ever inspect it.
     let auth_tag_json = extract_auth_tag_json(&event);
 
-    let relay_url =
-        crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &conn.tenant);
+    let relay_url = conn.auth_relay_url.clone().unwrap_or_else(|| {
+        crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &conn.tenant)
+    });
     let auth_svc = Arc::clone(&state.auth);
 
     metrics::counter!("buzz_auth_attempts_total", "method" => "nip42").increment(1);
@@ -286,7 +287,12 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
         Err(e) => {
             warn!(conn_id = %conn_id, error = %e, "NIP-42 auth failed");
             metrics::counter!("buzz_auth_failures_total", "reason" => "nip42_invalid").increment(1);
-            *conn.auth_state.write().await = AuthState::Failed;
+            // NIP-17 transport responses can be replayed by public relays.
+            // Keep its virtual session pending until the normal auth timeout so
+            // an obsolete challenge cannot reject the matching fresh response.
+            if conn.auth_relay_url.is_none() {
+                *conn.auth_state.write().await = AuthState::Failed;
+            }
             conn.send(RelayMessage::ok(
                 &event_id_hex,
                 false,

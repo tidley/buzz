@@ -1355,6 +1355,7 @@ pub(crate) mod tests {
                 "test.local".to_string(),
             ),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_relay_url: None,
             auth_state: RwLock::new(AuthState::Failed),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             send_tx: tx.clone(),

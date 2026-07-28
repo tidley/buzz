@@ -13,11 +13,16 @@ use thiserror::Error;
 use crate::connection::VirtualConnection;
 use crate::transport::RelayFrame;
 
+/// Prefix for the per-client-launch NIP-17 session tag.
+pub const SESSION_TAG_PREFIX: &str = "buzz-nip17-session:";
+
 /// Decrypted request delivered by a NIP-17 gateway client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayRequest {
     /// Verified public key that authored the inner NIP-59 seal and rumor.
     pub sender: PublicKey,
+    /// Per-client-launch identity used to isolate replayed public envelopes.
+    pub session_id: String,
     /// The plaintext NIP-01 request frame for the relay dispatcher.
     pub frame: RelayFrame,
 }
@@ -40,6 +45,9 @@ pub enum GatewayError {
     /// The decrypted rumor was not a NIP-17 private direct message.
     #[error("NIP-17 gift-wrap rumor must be kind 14")]
     InvalidRumorKind,
+    /// The NIP-17 envelope did not identify a client launch session.
+    #[error("NIP-17 gift-wrap rumor is missing a session tag")]
+    MissingSessionTag,
     /// A decrypted or outgoing plaintext frame exceeded the configured limit.
     #[error("NIP-17 gateway frame exceeds {max} bytes (got {got})")]
     FrameTooLarge {
@@ -92,9 +100,23 @@ impl Nip17Gateway {
             return Err(GatewayError::InvalidRumorKind);
         }
         self.check_frame_size(&rumor.content)?;
+        let session_id = rumor
+            .tags
+            .iter()
+            .find_map(|tag| {
+                let values = tag.as_slice();
+                (values.first().map(String::as_str) == Some("t"))
+                    .then(|| values.get(1))
+                    .flatten()
+                    .and_then(|value| value.strip_prefix(SESSION_TAG_PREFIX))
+                    .filter(|value| !value.is_empty())
+            })
+            .map(str::to_owned)
+            .ok_or(GatewayError::MissingSessionTag)?;
 
         Ok(GatewayRequest {
             sender,
+            session_id,
             frame: RelayFrame::Text(rumor.content),
         })
     }
@@ -113,8 +135,16 @@ impl Nip17Gateway {
         };
         self.check_frame_size(&content)?;
 
-        let rumor =
-            EventBuilder::private_msg_rumor(request.sender, content).build(self.keys.public_key());
+        let recipient = request.sender.to_hex();
+        let session = format!("{SESSION_TAG_PREFIX}{}", request.session_id);
+        let rumor = EventBuilder::new(Kind::PrivateDirectMessage, content)
+            .tags([
+                nostr::Tag::parse(vec!["p", &recipient])
+                    .map_err(|error| GatewayError::GiftWrap(error.to_string()))?,
+                nostr::Tag::parse(vec!["t", &session])
+                    .map_err(|error| GatewayError::GiftWrap(error.to_string()))?,
+            ])
+            .build(self.keys.public_key());
         let event = EventBuilder::gift_wrap(&self.keys, &request.sender, rumor, [])
             .await
             .map_err(|error| GatewayError::GiftWrap(error.to_string()))?;
@@ -161,7 +191,7 @@ impl Nip17Gateway {
 
 #[cfg(test)]
 mod tests {
-    use nostr::{nips::nip59, EventBuilder, Keys, Kind};
+    use nostr::{nips::nip59, EventBuilder, Keys, Kind, Tag};
 
     use super::{GatewayError, Nip17Gateway};
     use crate::transport::RelayFrame;
@@ -173,7 +203,13 @@ mod tests {
         let sender = Keys::generate();
         let recipient = Keys::generate();
         let request = r#"["REQ","inbox",{"kinds":[1]}]"#;
-        let rumor = EventBuilder::private_msg_rumor(recipient.public_key(), request)
+        let session_id = "test-session";
+        let rumor = EventBuilder::new(Kind::PrivateDirectMessage, request)
+            .tags([
+                Tag::parse(vec!["p", &recipient.public_key().to_hex()]).expect("recipient tag"),
+                Tag::parse(vec!["t", &format!("buzz-nip17-session:{session_id}")])
+                    .expect("session tag"),
+            ])
             .build(sender.public_key());
         let gift_wrap = EventBuilder::gift_wrap(&sender, &recipient.public_key(), rumor, [])
             .await
@@ -189,6 +225,7 @@ mod tests {
 
         assert_eq!(decoded.sender, sender.public_key());
         assert_eq!(decoded.frame, RelayFrame::Text(request.to_string()));
+        assert_eq!(decoded.session_id, session_id);
     }
 
     #[tokio::test]
@@ -198,6 +235,7 @@ mod tests {
         let gateway = Nip17Gateway::new(gateway_keys.clone(), MAX_FRAME_BYTES).expect("gateway");
         let request = super::GatewayRequest {
             sender: sender.public_key(),
+            session_id: "test-session".to_string(),
             frame: RelayFrame::Text(r#"["REQ","inbox",{}]"#.to_string()),
         };
         let response = r#"["EOSE","inbox"]"#;

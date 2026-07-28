@@ -3,10 +3,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use buzz_core::tenant::TenantContext;
-use buzz_ws_client::{NostrWsConnection, RelayMessage};
+use buzz_ws_client::{NostrWsConnection, RelayMessage, WsClientError};
 use nostr::{Event, Keys, Kind, PublicKey};
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -19,18 +19,22 @@ use crate::transport::RelayFrame;
 
 const SESSION_DEDUP_CAPACITY: usize = 1_024;
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const NIP17_RELAY_IDENTITY: &str = "wss://nip17.buzz.invalid";
+const GIFT_WRAP_REPLAY_SECS: u64 = 3 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SessionKey {
     community: String,
     sender: String,
+    session_id: String,
 }
 
 impl SessionKey {
-    fn new(tenant: &TenantContext, sender: PublicKey) -> Self {
+    fn new(tenant: &TenantContext, sender: PublicKey, session_id: String) -> Self {
         Self {
             community: tenant.community().as_uuid().to_string(),
             sender: sender.to_hex(),
+            session_id,
         }
     }
 }
@@ -101,11 +105,24 @@ async fn run_public_relay(
                 continue;
             }
         };
-        let subscription_id = format!("buzz-nip17-{}", keys.public_key().to_hex());
+        // NIP-01 limits subscription IDs to 64 characters. The complete
+        // gateway pubkey would make this 75 characters and some relays silently
+        // discard the REQ instead of returning CLOSED.
+        let public_key = keys.public_key().to_hex();
+        let subscription_id = format!("buzz-nip17-{}", &public_key[..16]);
+        let since = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs().saturating_sub(GIFT_WRAP_REPLAY_SECS))
+            .unwrap_or(0);
         let request = json!([
             "REQ",
             subscription_id,
-            { "kinds": [Kind::GiftWrap.as_u16()], "#p": [keys.public_key().to_hex()] }
+            {
+                "kinds": [Kind::GiftWrap.as_u16()],
+                "#p": [public_key],
+                "since": since,
+                "limit": 100,
+            }
         ]);
         if let Err(error) = connection.send_raw(&request).await {
             warn!(%relay_url, %error, "NIP-17 gateway subscription failed");
@@ -142,6 +159,10 @@ async fn run_public_relay(
                         ).await;
                     }
                     Ok(_) => {}
+                    Err(WsClientError::Timeout) => {
+                        // An idle relay is healthy. Keeping this subscription alive
+                        // prevents replaying old gift wraps every 30 seconds.
+                    }
                     Err(error) => {
                         debug!(%relay_url, %error, "NIP-17 gateway public relay disconnected");
                         break;
@@ -163,6 +184,7 @@ async fn route_envelope(
     responses: broadcast::Sender<EncryptedResponse>,
 ) {
     let event_id = event.id.to_hex();
+    info!(%event_id, %relay_url, "NIP-17 gateway received public envelope");
     let request = match gateway
         .unwrap_request(RelayFrame::Text(match serde_json::to_string(&event) {
             Ok(json) => json,
@@ -179,7 +201,8 @@ async fn route_envelope(
             return;
         }
     };
-    let key = SessionKey::new(&tenant, request.sender);
+    info!(%event_id, sender = %request.sender, "NIP-17 gateway decrypted public envelope");
+    let key = SessionKey::new(&tenant, request.sender, request.session_id.clone());
     let mut input = SessionInput {
         event_id,
         relay_url,
@@ -233,24 +256,31 @@ async fn run_session(
         return;
     };
     let sender = first.request.sender;
+    let session_id = first.request.session_id.clone();
     let mut seen = HashSet::new();
     let mut seen_order = VecDeque::new();
     let mut relay_url = first.relay_url.clone();
-    let mut connection =
-        match VirtualConnection::open(state, SocketAddr::from(([0, 0, 0, 0], 0)), tenant).await {
-            Ok(connection) => connection,
-            Err(error) => {
-                warn!(?error, "NIP-17 gateway could not open virtual session");
-                return;
-            }
-        };
+    let mut connection = match VirtualConnection::open_with_auth_relay_url(
+        state,
+        SocketAddr::from(([0, 0, 0, 0], 0)),
+        tenant,
+        Some(NIP17_RELAY_IDENTITY.to_string()),
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(error) => {
+            warn!(?error, "NIP-17 gateway could not open virtual session");
+            return;
+        }
+    };
 
     dispatch_request(&mut connection, first, &mut seen, &mut seen_order).await;
     loop {
         tokio::select! {
             request = requests.recv() => match request {
                 Some(request) => {
-                    if request.request.sender != sender {
+                    if request.request.sender != sender || request.request.session_id != session_id {
                         warn!("NIP-17 gateway session sender mismatch");
                         continue;
                     }
@@ -263,7 +293,11 @@ async fn run_session(
             },
             response = connection.next_frame() => match response {
                 Some(response) => {
-                    let request = GatewayRequest { sender, frame: RelayFrame::Text(String::new()) };
+                    let request = GatewayRequest {
+                        sender,
+                        session_id: session_id.clone(),
+                        frame: RelayFrame::Text(String::new()),
+                    };
                     match gateway.wrap_response(&request, response).await {
                         Ok(RelayFrame::Text(json)) => match serde_json::from_str(&json) {
                             Ok(event) => { let _ = responses.send(EncryptedResponse { relay_url: relay_url.clone(), event }); }
@@ -315,8 +349,8 @@ mod tests {
         let tenant_b =
             TenantContext::resolved(CommunityId::from_uuid(Uuid::from_u128(2)), "b.test");
         assert_ne!(
-            SessionKey::new(&tenant_a, sender),
-            SessionKey::new(&tenant_b, sender)
+            SessionKey::new(&tenant_a, sender, "session".to_string()),
+            SessionKey::new(&tenant_b, sender, "session".to_string())
         );
     }
 }

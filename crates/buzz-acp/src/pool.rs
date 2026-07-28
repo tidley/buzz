@@ -511,6 +511,8 @@ pub struct PromptContext {
     pub context_message_limit: u32,
     /// Max turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    /// Whether queued and active agent turns publish message reactions.
+    pub reactions_enabled: bool,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Agent identity — used to derive the NIP-AE conversation key at
@@ -1859,7 +1861,7 @@ pub async fn run_prompt_task(
     // 💬 — fire-and-forget so the prompt fires immediately.
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
     // A brief race where 💬 appears slightly after the agent starts is acceptable.
-    if !reaction_ids.is_empty() {
+    if ctx.reactions_enabled && !reaction_ids.is_empty() {
         let rest = ctx.rest_client.clone();
         let ids = reaction_ids.clone();
         tokio::spawn(async move {
@@ -5364,6 +5366,7 @@ mod tests {
             ),
             context_message_limit: 0,
             max_turns_per_session: 0,
+            reactions_enabled: true,
             permission_mode: PermissionMode::Default,
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,
