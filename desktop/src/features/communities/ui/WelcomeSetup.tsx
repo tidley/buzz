@@ -41,6 +41,11 @@ type WelcomeSetupProps = {
 const COMMUNITY_OPTION_CARD_CLASS =
   "w-full max-w-[320px] items-center px-6 py-4 text-center text-sm font-normal leading-6 text-foreground [--buzz-card-textured-min-height:88px] transition-[filter] duration-150 ease-out hover:brightness-[0.98] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-foreground/35";
 const NIP17_RELAY_IDENTITY = "wss://nip17.buzz.invalid";
+const DEFAULT_NIP17_PUBLIC_RELAYS = [
+  "wss://relay.damus.io",
+  "wss://nos.lol",
+  "wss://nostr.mom",
+].join("\n");
 
 export function WelcomeSetup({
   initialPage = "welcome",
@@ -57,7 +62,9 @@ export function WelcomeSetup({
   const [copiedNpub, setCopiedNpub] = React.useState(false);
   const [nip17Name, setNip17Name] = React.useState("Private community");
   const [nip17GatewayPubkey, setNip17GatewayPubkey] = React.useState("");
-  const [nip17PublicRelayUrls, setNip17PublicRelayUrls] = React.useState("");
+  const [nip17PublicRelayUrls, setNip17PublicRelayUrls] = React.useState(
+    DEFAULT_NIP17_PUBLIC_RELAYS,
+  );
   const [nip17Error, setNip17Error] = React.useState<string | null>(null);
   const communityOnboarding = useCommunityOnboarding();
   const identityQuery = useIdentityQuery();

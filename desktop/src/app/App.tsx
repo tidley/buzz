@@ -58,6 +58,7 @@ import { CommunityChangeOverlay } from "@/features/communities/ui/CommunityChang
 import { setAvatarProfileSyncQueryClient } from "@/features/profile/avatarProfileSync";
 import { createBuzzQueryClient } from "@/shared/api/queryClient";
 import { isSharedIdentity as isSharedIdentityCmd } from "@/shared/api/tauri";
+import { getIdentity } from "@/shared/api/tauriIdentity";
 import { getProfile } from "@/shared/api/tauriProfiles";
 import {
   type AddCommunityDeepLinkPayload,
@@ -454,6 +455,20 @@ function CommunityApp({
     if (profileCheckTransactionRef.current === transactionId) return;
     profileCheckTransactionRef.current = transactionId;
 
+    // NIP-17 has no direct HTTP relay endpoint. Profile setup uses legacy HTTP
+    // commands, so finish onboarding once the encrypted relay session is ready.
+    if (transaction.relayTransport === "nip17") {
+      void getIdentity().then((identity) => {
+        if (
+          !isTransactionStillConnecting(transactionRef.current, transactionId)
+        )
+          return;
+        markCommunityOnboardingComplete(identity.pubkey, relayUrl);
+        communityOnboarding.clear();
+      });
+      return;
+    }
+
     // resolveProfileCheckAction resolves exactly once (Promise.race + timer
     // cleared on settle), so no settled flag is needed here.
     void resolveProfileCheckAction(getProfile, 10_000).then((result) => {
@@ -480,6 +495,7 @@ function CommunityApp({
     transaction?.stage,
     transaction?.id,
     transaction?.relayUrl,
+    transaction?.relayTransport,
   ]);
   // During "entering" the transaction stays alive as a curtain: the app mounts
   // underneath (already pointed at the Welcome channel route) while the
