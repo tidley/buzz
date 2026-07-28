@@ -207,6 +207,12 @@ class _ErrorPairingNotifier extends Notifier<PairingState>
 
   @override
   void denySas() {}
+
+  @override
+  Future<void> debugProcessPayloadForTest(
+    String? payloadType,
+    String payload,
+  ) async {}
 }
 
 class _ConnectingPairingNotifier extends Notifier<PairingState>
@@ -225,6 +231,12 @@ class _ConnectingPairingNotifier extends Notifier<PairingState>
 
   @override
   void denySas() {}
+
+  @override
+  Future<void> debugProcessPayloadForTest(
+    String? payloadType,
+    String payload,
+  ) async {}
 }
 
 class _ConfirmingSasPairingNotifier extends Notifier<PairingState>
@@ -246,4 +258,10 @@ class _ConfirmingSasPairingNotifier extends Notifier<PairingState>
 
   @override
   void denySas() {}
+
+  @override
+  Future<void> debugProcessPayloadForTest(
+    String? payloadType,
+    String payload,
+  ) async {}
 }

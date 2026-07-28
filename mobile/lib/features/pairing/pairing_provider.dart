@@ -67,11 +67,15 @@ typedef PairingSocketFactory =
 
 class PairingNotifier extends Notifier<PairingState> {
   final PairingSocketFactory _socketFactory;
+  final RelaySocketFactory _credentialSocketFactory;
   PairingSocket? _socket;
   Timer? _sessionTimeout;
 
-  PairingNotifier({PairingSocketFactory? socketFactory})
-    : _socketFactory = socketFactory ?? _createPairingSocket;
+  PairingNotifier({
+    PairingSocketFactory? socketFactory,
+    RelaySocketFactory? credentialSocketFactory,
+  }) : _socketFactory = socketFactory ?? _createPairingSocket,
+       _credentialSocketFactory = credentialSocketFactory ?? RelaySocket.new;
 
   static PairingSocket _createPairingSocket({
     required String wsUrl,
@@ -139,6 +143,12 @@ class PairingNotifier extends Notifier<PairingState> {
     _cleanup();
     state = const PairingState();
   }
+
+  @visibleForTesting
+  Future<void> debugProcessPayloadForTest(
+    String? payloadType,
+    String payload,
+  ) => _processPayload(payloadType, payload);
 
   void _cleanup() {
     _sessionTimeout?.cancel();
@@ -449,30 +459,16 @@ class PairingNotifier extends Notifier<PairingState> {
     try {
       // Parse the custom payload.
       final data = jsonDecode(payload) as Map<String, dynamic>;
-      final relayUrl = data['relayUrl'] as String?;
-      final pubkey = data['pubkey'] as String?;
-      final nsec = data['nsec'] as String?;
+      final community = _communityFromPayload(data);
 
-      if (relayUrl == null) {
-        throw const FormatException('Missing relayUrl in payload');
-      }
-
-      // Validate relay URL to prevent SSRF via private network addresses.
-      _validateRelayUrl(relayUrl);
-
-      // Validate credentials against the relay via NIP-42 WS handshake.
-      await _validateCredentials(relayUrl: relayUrl, nsec: nsec);
+      // Validate credentials through the imported transport. NIP-17 pairing
+      // must not probe the private relay directly from the mobile device.
+      await _validateCredentials(community);
 
       // Send complete only after credentials are validated.
       _sendComplete(true);
 
       // Store as community and switch to it.
-      final community = Community.create(
-        name: Community.nameFromUrl(relayUrl),
-        relayUrl: relayUrl,
-        pubkey: pubkey,
-        nsec: nsec,
-      );
       await ref
           .read(authProvider.notifier)
           .authenticateWithCommunity(community);
@@ -566,10 +562,7 @@ class PairingNotifier extends Notifier<PairingState> {
     try {
       final community = _parseLegacyInput(rawInput);
 
-      await _validateCredentials(
-        relayUrl: community.relayUrl,
-        nsec: community.nsec,
-      );
+      await _validateCredentials(community);
 
       await ref
           .read(authProvider.notifier)
@@ -597,29 +590,78 @@ class PairingNotifier extends Notifier<PairingState> {
     }
   }
 
-  Future<void> _validateCredentials({
-    required String relayUrl,
-    required String? nsec,
-  }) async {
-    if (nsec == null || nsec.isEmpty) {
+  Future<void> _validateCredentials(Community community) async {
+    if (community.nsec == null || community.nsec!.isEmpty) {
       throw const FormatException('Pairing payload missing nsec');
     }
-    final uri = Uri.parse(relayUrl);
+    final uri = Uri.parse(community.relayUrl);
     final scheme = uri.scheme == 'https' ? 'wss' : 'ws';
     final wsUrl = uri.replace(scheme: scheme).toString();
+    final connected = Completer<void>();
 
-    final socket = RelaySocket(
+    final socket = _credentialSocketFactory(
       wsUrl: wsUrl,
-      nsec: nsec,
+      nsec: community.nsec,
       onMessage: (_) {},
-      onConnected: () {},
-      onDisconnected: (_) {},
+      onConnected: () {
+        if (!connected.isCompleted) connected.complete();
+      },
+      onDisconnected: (error) {
+        if (!connected.isCompleted) {
+          connected.completeError(error ?? Exception('Connection closed'));
+        }
+      },
+      transportFactory: relayTransportFactoryFor(
+        RelayConfig(
+          baseUrl: community.relayUrl,
+          nsec: community.nsec,
+          relayTransport: community.relayTransport,
+          nip17GatewayPubkey: community.nip17GatewayPubkey,
+          nip17PublicRelayUrls: community.nip17PublicRelayUrls,
+          preferFips: community.preferFips,
+        ),
+      ),
     );
     try {
-      await socket.connect().timeout(const Duration(seconds: 8));
+      await socket.connect();
+      await connected.future.timeout(const Duration(seconds: 8));
     } finally {
       await socket.disconnect();
     }
+  }
+
+  Community _communityFromPayload(Map<String, dynamic> data) {
+    final relayUrl = data['relayUrl'] as String?;
+    if (relayUrl == null) {
+      throw const FormatException('Missing relayUrl in payload');
+    }
+    _validateRelayUrl(relayUrl);
+
+    final transportValue = data['relayTransport'];
+    final relayTransport = RelayTransportMode.fromStorageValue(transportValue);
+    if (transportValue != null && relayTransport == null) {
+      throw const FormatException('Invalid relay transport in payload');
+    }
+    final gatewayPubkey = data['nip17GatewayPubkey'];
+    final publicRelayUrls = data['nip17PublicRelayUrls'];
+    if (relayTransport == RelayTransportMode.nip17 &&
+        (gatewayPubkey is! String ||
+            publicRelayUrls is! List ||
+            !publicRelayUrls.every((url) => url is String))) {
+      throw const FormatException('Invalid NIP-17 relay configuration');
+    }
+
+    return Community.create(
+      name: Community.nameFromUrl(relayUrl),
+      relayUrl: relayUrl,
+      pubkey: data['pubkey'] as String?,
+      nsec: data['nsec'] as String?,
+      relayTransport: relayTransport ?? RelayTransportMode.direct,
+      nip17GatewayPubkey: gatewayPubkey as String?,
+      nip17PublicRelayUrls: publicRelayUrls is List
+          ? publicRelayUrls.cast<String>()
+          : const [],
+    );
   }
 
   Community _parseLegacyInput(String raw) {
@@ -643,12 +685,7 @@ class PairingNotifier extends Notifier<PairingState> {
 
     _validateRelayUrl(relayUrl);
 
-    return Community.create(
-      name: Community.nameFromUrl(relayUrl),
-      relayUrl: relayUrl,
-      pubkey: decoded['pubkey'] as String?,
-      nsec: decoded['nsec'] as String?,
-    );
+    return _communityFromPayload(decoded);
   }
 
   void _validateRelayUrl(String url) {

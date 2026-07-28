@@ -531,9 +531,6 @@ The mobile app lives in `mobile/` — a Flutter app using Riverpod + Hooks.
 
 - **NEVER use `StatefulWidget`** — favor Riverpod for state and always use
   `HookConsumerWidget` or `ConsumerWidget` with `flutter_hooks` for local state.
-- **NEVER run `flutter run`, `flutter build`, `flutter clean`, or
-  `flutter upgrade`** — only `flutter test`, `flutter analyze`, and
-  `dart format` are safe for agents to run.
 - **Do NOT use `print()`** — use `debugPrint()` or structured logging.
 - Prefer `context.colors` and `context.textTheme` (via theme extensions)
   over raw `Theme.of(context)` calls.

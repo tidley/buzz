@@ -40,6 +40,7 @@ void main() {
         expect(rumor.kind, nostr.DirectMessage.kindDirectMessage);
         expect(rumor.pubkey, user.public);
         expect(_hasRecipient(rumor.tags, gateway.public), isTrue);
+        expect(_sessionId(rumor.tags), isNotNull);
         expect(rumor.content, '["REQ","inbox",{"kinds":[1]}]');
       }
     },
@@ -76,7 +77,27 @@ void main() {
       await _gatewayResponse(
         gateway: gateway,
         recipient: user,
+        content: '["NOTICE","stale"]',
+      ),
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    expect(received, isEmpty);
+
+    final request = relay.nextEvent();
+    transport.send('["REQ","session",{"kinds":[1]}]');
+    final requestRumor = await nostr.DirectMessage.parse(
+      giftWrap: await request,
+      recipientSecretKey: gateway.secret,
+    );
+    final sessionId = _sessionId(requestRumor.tags);
+
+    relay.addEvent(
+      await _gatewayResponse(
+        gateway: gateway,
+        recipient: user,
         content: '["NOTICE","from gateway"]',
+        sessionId: sessionId!,
       ),
     );
     await Future<void>.delayed(Duration.zero);
@@ -89,12 +110,33 @@ Future<nostr.Event> _gatewayResponse({
   required nostr.Keys gateway,
   required nostr.Keys recipient,
   required String content,
+  String? sessionId,
 }) {
-  return nostr.DirectMessage.create(
-    message: content,
+  final rumor = nostr.Event.unsigned(
+    pubkey: gateway.public,
+    kind: nostr.DirectMessage.kindDirectMessage,
+    content: content,
+    tags: [
+      ['p', recipient.public],
+      if (sessionId != null) ['t', 'buzz-nip17-session:$sessionId'],
+    ],
+  );
+  return nostr.GiftWrap.wrap(
+    rumor: rumor,
     authorSecretKey: gateway.secret,
     recipientPubkey: recipient.public,
   );
+}
+
+String? _sessionId(List<List<String>> tags) {
+  for (final tag in tags) {
+    if (tag.length >= 2 &&
+        tag[0] == 't' &&
+        tag[1].startsWith('buzz-nip17-session:')) {
+      return tag[1].substring('buzz-nip17-session:'.length);
+    }
+  }
+  return null;
 }
 
 bool _hasRecipient(List<List<String>> tags, String pubkey) =>

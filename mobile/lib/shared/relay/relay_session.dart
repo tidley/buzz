@@ -186,12 +186,19 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     return const SessionState(status: SessionStatus.disconnected);
   }
 
-  /// Execute a one-shot query via the relay's HTTP bridge (`POST /query`).
+  /// Execute a one-shot query. NIP-17 sessions use tunneled relay REQ frames
+  /// so the device never contacts the private relay HTTP bridge directly.
   Future<List<NostrEvent>> queryRelay(
     List<NostrFilter> filters, {
     Duration timeout = const Duration(seconds: 8),
   }) async {
     final config = ref.read(relayConfigProvider);
+    if (config.usesNip17) {
+      final results = await Future.wait(
+        filters.map((filter) => fetchHistory(filter, timeout: timeout)),
+      );
+      return results.expand((events) => events).toList();
+    }
     final url = Uri.parse(config.baseUrl).resolve('/query').toString();
     final bodyBytes = utf8.encode(
       jsonEncode(filters.map((filter) => filter.toJson()).toList()),

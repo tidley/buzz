@@ -107,6 +107,41 @@ void main() {
     );
   });
 
+  test('queryRelay uses relay REQ frames for NIP-17 sessions', () async {
+    final keychain = nostr.Keys.generate();
+    var httpRequests = 0;
+    final session = RelaySessionNotifier(
+      httpClient: http_testing.MockClient((_) async {
+        httpRequests++;
+        return http.Response('[]', 200);
+      }),
+    );
+    final container = ProviderContainer(
+      overrides: [
+        relaySessionProvider.overrideWith(() => session),
+        relayConfigProvider.overrideWith(
+          () => _FakeRelayConfigNotifier(
+            baseUrl: 'https://private.example',
+            nsec: keychain.nsec,
+            relayTransport: RelayTransportMode.nip17,
+            nip17GatewayPubkey: nostr.Keys.generate().public,
+            nip17PublicRelayUrls: const ['wss://public.example'],
+          ),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    final query = container.read(relaySessionProvider.notifier).queryRelay([
+      const NostrFilter(kinds: [EventKind.streamMessageV2]),
+    ]);
+    session.debugHandleMessage(['EVENT', 'h-1', _event().toJson()]);
+    session.debugHandleMessage(['EOSE', 'h-1']);
+
+    expect(await query, [_event()]);
+    expect(httpRequests, 0);
+  });
+
   test(
     'history timeout rejects instead of returning partial empty data',
     () async {

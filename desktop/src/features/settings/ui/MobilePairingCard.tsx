@@ -16,6 +16,11 @@ import {
   confirmPairingSas,
   startPairing,
 } from "@/shared/api/tauri";
+import {
+  loadActiveCommunityId,
+  loadCommunities,
+} from "@/features/communities/communityStorage";
+import { normalizeNip17Config } from "@/shared/api/nip17Transport";
 import { Button } from "@/shared/ui/button";
 import { StyledQrCode } from "@/shared/ui/styled-qr-code";
 import {
@@ -191,7 +196,11 @@ export function MobilePairingCard({
     setSasCode(null);
     setError(null);
 
-    startPairing().then(
+    const activeCommunityId = loadActiveCommunityId();
+    const activeCommunity = loadCommunities().find(
+      (community) => community.id === activeCommunityId,
+    );
+    startPairing(normalizeNip17Config(activeCommunity ?? {})).then(
       (uri) => {
         if (requestId === requestIdRef.current) {
           setQrUri(uri);

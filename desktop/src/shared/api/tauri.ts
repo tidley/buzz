@@ -1,4 +1,5 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import type { Nip17CommunityConfig } from "./nip17Transport";
 import {
   activateRateLimit,
   parseRateLimitHint,
@@ -1157,8 +1158,10 @@ export async function nip44DecryptFromSelf(
 
 // ── NIP-AB device pairing ───────────────────────────────────────────────────
 
-export async function startPairing(): Promise<string> {
-  return invokeTauri<string>("start_pairing");
+export async function startPairing(
+  transport: Nip17CommunityConfig,
+): Promise<string> {
+  return tauriInvoke<string>("start_pairing", { transport });
 }
 
 export async function confirmPairingSas(): Promise<void> {

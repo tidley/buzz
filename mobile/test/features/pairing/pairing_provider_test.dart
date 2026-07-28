@@ -5,6 +5,8 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:buzz/features/pairing/pairing_provider.dart';
 import 'package:buzz/features/pairing/pairing_socket.dart';
 import 'package:buzz/shared/auth/auth.dart';
+import 'package:buzz/shared/relay/relay.dart';
+import 'package:nostr/nostr.dart' as nostr;
 
 /// Tests for [PairingNotifier]'s legacy `buzz://` payload parsing and
 /// SSRF-prevention validation.
@@ -86,6 +88,62 @@ void main() {
       expect(state.status, PairingStatus.error);
       expect(state.errorMessage, contains('missing nsec'));
       expect(fakeAuth.lastCommunity, isNull);
+    });
+
+    test('imports NIP-17 credentials through the relay transport', () async {
+      RelayTransportFactory? selectedTransportFactory;
+      final notifier = PairingNotifier(
+        credentialSocketFactory:
+            ({
+              required wsUrl,
+              required nsec,
+              required onMessage,
+              required onConnected,
+              required onDisconnected,
+              required transportFactory,
+            }) {
+              selectedTransportFactory = transportFactory;
+              return _ConnectedRelaySocket(
+                wsUrl: wsUrl,
+                nsec: nsec,
+                onMessage: onMessage,
+                onConnected: onConnected,
+                onDisconnected: onDisconnected,
+              );
+            },
+      );
+      fakeAuth = FakeAuthNotifier();
+      container = ProviderContainer(
+        overrides: [
+          pairingProvider.overrideWith(() => notifier),
+          authProvider.overrideWith(() => fakeAuth),
+        ],
+      );
+      container.read(pairingProvider);
+      final keychain = nostr.Keys.generate();
+
+      await notifier.debugProcessPayloadForTest(
+        'custom',
+        jsonEncode({
+          'relayUrl': 'https://private.example',
+          'nsec': keychain.nsec,
+          'relayTransport': 'nip17',
+          'nip17GatewayPubkey':
+              '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+          'nip17PublicRelayUrls': ['wss://public.example'],
+        }),
+      );
+
+      expect(selectedTransportFactory, isNotNull);
+      expect(container.read(pairingProvider).status, PairingStatus.success);
+      expect(fakeAuth.lastCommunity?.relayTransport, RelayTransportMode.nip17);
+      expect(
+        fakeAuth.lastCommunity?.nip17GatewayPubkey,
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+      );
+      expect(fakeAuth.lastCommunity?.nip17PublicRelayUrls, [
+        'wss://public.example',
+      ]);
     });
 
     test('accepts buzz scheme prefix', () async {
@@ -240,4 +298,19 @@ class _DisconnectingSocket extends PairingSocket {
   Future<void> connect() async {
     disconnectCallback(Exception('Connection closed'));
   }
+}
+
+class _ConnectedRelaySocket extends RelaySocket {
+  final void Function() _connected;
+
+  _ConnectedRelaySocket({
+    required super.wsUrl,
+    required super.nsec,
+    required super.onMessage,
+    required super.onConnected,
+    required super.onDisconnected,
+  }) : _connected = onConnected;
+
+  @override
+  Future<void> connect() async => _connected();
 }

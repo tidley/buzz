@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:nostr/nostr.dart' as nostr;
+import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 /// A bidirectional transport for relay protocol frames.
@@ -61,6 +62,8 @@ class WebSocketRelayTransport implements RelayTransport {
 /// The gateway key is the expected author of the decrypted NIP-17 response.
 /// Public relays only see signed kind:1059 gift wraps addressed to that key.
 class Nip17RelayTransport implements RelayTransport {
+  static const _sessionTagPrefix = 'buzz-nip17-session:';
+
   final String _privateKey;
   final String _publicKey;
   final String _gatewayPubkey;
@@ -68,6 +71,7 @@ class Nip17RelayTransport implements RelayTransport {
   final StreamController<dynamic> _frames = StreamController.broadcast();
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   final String _subscriptionId;
+  final String _sessionId;
   Future<void> _sendQueue = Future.value();
 
   @override
@@ -86,7 +90,8 @@ class Nip17RelayTransport implements RelayTransport {
   }) : _privateKey = _decodePrivateKey(nsec),
        _gatewayPubkey = _validatePubkey(gatewayPubkey),
        _publicKey = nostr.Keys(_decodePrivateKey(nsec)).public,
-       _subscriptionId = 'buzz-nip17-${DateTime.now().microsecondsSinceEpoch}' {
+       _subscriptionId = 'buzz-nip17-${DateTime.now().microsecondsSinceEpoch}',
+       _sessionId = const Uuid().v4() {
     if (publicRelayUrls.isEmpty) {
       throw ArgumentError.value(
         publicRelayUrls,
@@ -186,6 +191,7 @@ class Nip17RelayTransport implements RelayTransport {
         content: frame,
         tags: [
           ['p', _gatewayPubkey],
+          ['t', '$_sessionTagPrefix$_sessionId'],
         ],
       );
       final giftWrap = await nostr.GiftWrap.wrap(
@@ -235,7 +241,8 @@ class Nip17RelayTransport implements RelayTransport {
       // injecting otherwise valid encrypted relay frames.
       if (rumor.pubkey.toLowerCase() != _gatewayPubkey ||
           rumor.kind != nostr.DirectMessage.kindDirectMessage ||
-          !_hasRecipient(rumor.tags, _publicKey)) {
+          !_hasRecipient(rumor.tags, _publicKey) ||
+          !_hasSessionTag(rumor.tags, _sessionId)) {
         return;
       }
       _frames.add(rumor.content);
@@ -247,6 +254,14 @@ class Nip17RelayTransport implements RelayTransport {
   static bool _hasRecipient(List<List<String>> tags, String pubkey) => tags.any(
     (tag) => tag.length >= 2 && tag[0] == 'p' && tag[1].toLowerCase() == pubkey,
   );
+
+  static bool _hasSessionTag(List<List<String>> tags, String sessionId) =>
+      tags.any(
+        (tag) =>
+            tag.length >= 2 &&
+            tag[0] == 't' &&
+            tag[1] == '$_sessionTagPrefix$sessionId',
+      );
 
   static String _decodePrivateKey(String nsec) {
     final decoded = nostr.Nip19.decode(payload: nsec);

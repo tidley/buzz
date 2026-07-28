@@ -8,7 +8,7 @@ use buzz_core_pkg::pairing::session::PairingSession;
 use buzz_core_pkg::pairing::types::{AbortReason, PayloadType};
 use futures_util::{SinkExt, StreamExt};
 use nostr::ToBech32;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -63,6 +63,14 @@ impl PairingHandle {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingTransport {
+    relay_transport: String,
+    nip17_gateway_pubkey: Option<String>,
+    nip17_public_relay_urls: Option<Vec<String>>,
+}
+
 /// Start a NIP-AB pairing session as the source device.
 ///
 /// Creates a `PairingSession`, connects to the relay, and returns the
@@ -73,6 +81,7 @@ pub async fn start_pairing(
     app: AppHandle,
     state: State<'_, AppState>,
     pairing: State<'_, PairingHandle>,
+    transport: PairingTransport,
 ) -> Result<String, String> {
     let task_generation = pairing
         .generation
@@ -112,6 +121,9 @@ pub async fn start_pairing(
         "relayUrl": http_url,
         "pubkey": pubkey_hex,
         "nsec": nsec,
+        "relayTransport": transport.relay_transport,
+        "nip17GatewayPubkey": transport.nip17_gateway_pubkey,
+        "nip17PublicRelayUrls": transport.nip17_public_relay_urls,
     });
 
     {
