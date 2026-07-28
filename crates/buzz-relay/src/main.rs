@@ -465,6 +465,18 @@ async fn main() -> anyhow::Result<()> {
         )?;
     }
 
+    #[cfg(feature = "fips")]
+    if let Some(fips) = config.fips.clone() {
+        let tenant = buzz_relay::tenant::bind_deployment_community(&state.db, &config.relay_url)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "FIPS requires RELAY_URL to resolve to an active deployment community"
+                )
+            })?;
+        buzz_relay::fips_runtime::spawn(Arc::clone(&state), tenant, fips)?;
+    }
+
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
     // kill switch is off — nothing is bound, published, or spawned, so the
     // relay behaves byte-identically to a build without the mesh. When

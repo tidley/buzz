@@ -1,4 +1,5 @@
 import type { Community } from "./types";
+import { normalizeNip17Config } from "@/shared/api/nip17Transport";
 import { homeDir } from "@tauri-apps/api/path";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 
@@ -68,9 +69,11 @@ export function loadCommunities(): Community[] {
       if (entry && typeof entry === "object" && "nsec" in entry) {
         const { nsec: _nsec, ...rest } = entry;
         didStrip = true;
-        return rest;
+        return { ...rest, ...normalizeNip17Config(rest) };
       }
-      return entry;
+      return entry && typeof entry === "object"
+        ? { ...entry, ...normalizeNip17Config(entry) }
+        : entry;
     }) as Community[];
     if (didStrip) {
       setLocalStorageItemWithRecovery(COMMUNITIES_KEY, JSON.stringify(cleaned));

@@ -17,6 +17,8 @@ import {
   DialogTitle,
 } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
+import { Switch } from "@/shared/ui/switch";
+import { normalizeNip17Config } from "@/shared/api/nip17Transport";
 
 type EditCommunityDialogProps = {
   community: Community | null;
@@ -25,7 +27,16 @@ type EditCommunityDialogProps = {
   onSave: (
     id: string,
     updates: Partial<
-      Pick<Community, "name" | "relayUrl" | "token" | "reposDir">
+      Pick<
+        Community,
+        | "name"
+        | "relayUrl"
+        | "token"
+        | "reposDir"
+        | "relayTransport"
+        | "nip17GatewayPubkey"
+        | "nip17PublicRelayUrls"
+      >
     >,
   ) => void;
   onRemove?: (id: string) => void;
@@ -46,6 +57,10 @@ export function EditCommunityDialog({
   const [relayUrl, setRelayUrl] = React.useState("");
   const [token, setToken] = React.useState("");
   const [reposDir, setReposDir] = React.useState("");
+  const [useNip17, setUseNip17] = React.useState(false);
+  const [gatewayPubkey, setGatewayPubkey] = React.useState("");
+  const [publicRelayUrls, setPublicRelayUrls] = React.useState("");
+  const [nip17Error, setNip17Error] = React.useState<string | null>(null);
   const [reposDirError, setReposDirError] = React.useState<string | null>(null);
   const membershipQuery = useMyRelayMembershipLookupQuery();
   const activeRole = membershipQuery.data?.membership?.role;
@@ -62,7 +77,11 @@ export function EditCommunityDialog({
       setRelayUrl(community.relayUrl);
       setToken(community.token ?? "");
       setReposDir(community.reposDir ?? "");
+      setUseNip17(community.relayTransport === "nip17");
+      setGatewayPubkey(community.nip17GatewayPubkey ?? "");
+      setPublicRelayUrls(community.nip17PublicRelayUrls?.join("\n") ?? "");
       setReposDirError(null);
+      setNip17Error(null);
     }
   }, [community, open]);
 
@@ -78,7 +97,16 @@ export function EditCommunityDialog({
       }
 
       const updates: Partial<
-        Pick<Community, "name" | "relayUrl" | "token" | "reposDir">
+        Pick<
+          Community,
+          | "name"
+          | "relayUrl"
+          | "token"
+          | "reposDir"
+          | "relayTransport"
+          | "nip17GatewayPubkey"
+          | "nip17PublicRelayUrls"
+        >
       > = {};
 
       const trimmedName = name.trim();
@@ -94,6 +122,26 @@ export function EditCommunityDialog({
       const trimmedToken = token.trim() || undefined;
       if (trimmedToken !== community.token) {
         updates.token = trimmedToken;
+      }
+
+      const nip17 = normalizeNip17Config({
+        relayTransport: useNip17 ? "nip17" : "direct",
+        nip17GatewayPubkey: gatewayPubkey.trim(),
+        nip17PublicRelayUrls: publicRelayUrls.split(/\s+/).filter(Boolean),
+      });
+      if (useNip17 && nip17.relayTransport !== "nip17") {
+        setNip17Error(
+          "Enter a 64-character gateway pubkey and at least one ws:// or wss:// public relay.",
+        );
+        return;
+      }
+      if (
+        nip17.relayTransport !== community.relayTransport ||
+        nip17.nip17GatewayPubkey !== community.nip17GatewayPubkey ||
+        JSON.stringify(nip17.nip17PublicRelayUrls) !==
+          JSON.stringify(community.nip17PublicRelayUrls)
+      ) {
+        Object.assign(updates, nip17);
       }
 
       // Expand `~` to an absolute path before save — the backend rejects
@@ -119,7 +167,18 @@ export function EditCommunityDialog({
 
       handleClose();
     },
-    [community, name, relayUrl, token, reposDir, onSave, handleClose],
+    [
+      community,
+      name,
+      relayUrl,
+      token,
+      reposDir,
+      useNip17,
+      gatewayPubkey,
+      publicRelayUrls,
+      onSave,
+      handleClose,
+    ],
   );
 
   const handleRemove = React.useCallback(() => {
@@ -172,6 +231,47 @@ export function EditCommunityDialog({
               type="text"
               value={name}
             />
+          </div>
+          <div className="rounded-xl border border-border/70 p-3">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-medium">Private relay transport</p>
+                <p className="text-xs text-muted-foreground">
+                  Route relay frames through a NIP-17 gateway on public relays.
+                </p>
+              </div>
+              <Switch
+                checked={useNip17}
+                onCheckedChange={(checked) => {
+                  setUseNip17(checked);
+                  setNip17Error(null);
+                }}
+              />
+            </div>
+            {useNip17 ? (
+              <div className="mt-3 flex flex-col gap-3">
+                <Input
+                  onChange={(event) => {
+                    setGatewayPubkey(event.target.value);
+                    setNip17Error(null);
+                  }}
+                  placeholder="Gateway pubkey (64 hex characters)"
+                  value={gatewayPubkey}
+                />
+                <textarea
+                  className="min-h-20 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  onChange={(event) => {
+                    setPublicRelayUrls(event.target.value);
+                    setNip17Error(null);
+                  }}
+                  placeholder={"wss://relay.example\nwss://relay2.example"}
+                  value={publicRelayUrls}
+                />
+                {nip17Error ? (
+                  <p className="text-xs text-destructive">{nip17Error}</p>
+                ) : null}
+              </div>
+            ) : null}
           </div>
           <div className="flex flex-col gap-1.5">
             <label

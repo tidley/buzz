@@ -15,5 +15,5 @@ default = []
 
 [dependencies]
 # Keep the upstream source and revision explicit for reproducible Android builds.
-fips-mobile = { git = "https://github.com/tidley/fips.git", rev = "3f58f1c", package = "fips-mobile", default-features = false, features = ["nostr-discovery"] }
+fips-mobile = { git = "https://github.com/tidley/fips.git", rev = "09e209f", package = "fips-mobile", default-features = false, features = ["nostr-discovery"] }
 tokio.workspace = true

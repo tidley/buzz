@@ -21,6 +21,9 @@ pub mod connection;
 pub mod discovery;
 /// Relay error types.
 pub mod error;
+/// Opt-in FIPS QUIC responder transport.
+#[cfg(feature = "fips")]
+pub mod fips_runtime;
 /// WebSocket message handlers for NIP-01 client commands.
 pub mod handlers;
 /// Stateless HMAC-signed relay invite tokens (mint/verify).

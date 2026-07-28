@@ -64,6 +64,18 @@ pub struct Nip17GatewayConfig {
     pub relays: Vec<String>,
 }
 
+/// Opt-in FIPS QUIC responder configuration.
+#[cfg(feature = "fips")]
+#[derive(Debug, Clone)]
+pub struct FipsConfig {
+    /// Stable FIPS Nostr secret key, encoded as hex or `nsec`.
+    pub private_key: String,
+    /// Public Nostr relays used for advertisements and encrypted signaling.
+    pub nostr_relays: Vec<String>,
+    /// STUN servers used for UDP traversal.
+    pub stun_servers: Vec<String>,
+}
+
 /// Relay runtime configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -112,6 +124,9 @@ pub struct Config {
     pub discovery: Option<DiscoveryConfig>,
     /// Optional NIP-17 gateway transport configuration.
     pub nip17_gateway: Option<Nip17GatewayConfig>,
+    /// Optional FIPS QUIC responder transport configuration.
+    #[cfg(feature = "fips")]
+    pub fips: Option<FipsConfig>,
     /// Optional Unix Domain Socket path. When set, the relay also listens on this
     /// UDS for traffic (e.g. service mesh sidecar). Health probes still use TCP.
     pub uds_path: Option<String>,
@@ -514,6 +529,87 @@ fn nip17_gateway_config_from_env() -> Result<Option<Nip17GatewayConfig>, ConfigE
     }))
 }
 
+#[cfg(feature = "fips")]
+fn fips_config_from_env() -> Result<Option<FipsConfig>, ConfigError> {
+    if !parse_bool("BUZZ_FIPS_ENABLED", false)? {
+        return Ok(None);
+    }
+
+    let private_key = std::env::var("BUZZ_FIPS_PRIVATE_KEY")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ConfigError::InvalidValue(
+                "BUZZ_FIPS_PRIVATE_KEY is required when BUZZ_FIPS_ENABLED=true".to_string(),
+            )
+        })?;
+    fips::Identity::from_secret_str(&private_key).map_err(|error| {
+        ConfigError::InvalidValue(format!(
+            "BUZZ_FIPS_PRIVATE_KEY is not a valid FIPS secret: {error}"
+        ))
+    })?;
+
+    let nostr_relays = parse_fips_list("BUZZ_FIPS_NOSTR_RELAYS", "Nostr relay", |value| {
+        let url = url::Url::parse(value).map_err(|error| error.to_string())?;
+        if !matches!(url.scheme(), "ws" | "wss")
+            || url.host().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(
+                "must be a ws:// or wss:// URL without credentials, query, or fragment".to_string(),
+            );
+        }
+        Ok(url.to_string())
+    })?;
+    let stun_servers = parse_fips_list("BUZZ_FIPS_STUN_SERVERS", "STUN server", |value| {
+        let value = value
+            .strip_prefix("stun:")
+            .ok_or_else(|| "must start with stun:".to_string())?;
+        if value.is_empty() || value.contains(['/', '?', '#', '@']) {
+            return Err("must be a stun:host:port URI".to_string());
+        }
+        Ok(format!("stun:{value}"))
+    })?;
+
+    Ok(Some(FipsConfig {
+        private_key,
+        nostr_relays,
+        stun_servers,
+    }))
+}
+
+#[cfg(feature = "fips")]
+fn parse_fips_list(
+    name: &str,
+    description: &str,
+    parse: impl Fn(&str) -> Result<String, String>,
+) -> Result<Vec<String>, ConfigError> {
+    let raw = std::env::var(name).unwrap_or_default();
+    let mut values = Vec::new();
+    for value in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let value = parse(value).map_err(|error| {
+            ConfigError::InvalidValue(format!("{name} contains an invalid {description}: {error}"))
+        })?;
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    if values.is_empty() {
+        return Err(ConfigError::InvalidValue(format!(
+            "{name} must contain at least one {description} when BUZZ_FIPS_ENABLED=true"
+        )));
+    }
+    Ok(values)
+}
+
 fn parse_optional_bool(name: &str) -> Result<bool, ConfigError> {
     parse_bool(name, false)
 }
@@ -740,6 +836,8 @@ impl Config {
         let relay_private_key = std::env::var("BUZZ_RELAY_PRIVATE_KEY").ok();
         let discovery = discovery_config_from_env()?;
         let nip17_gateway = nip17_gateway_config_from_env()?;
+        #[cfg(feature = "fips")]
+        let fips = fips_config_from_env()?;
 
         let uds_path = std::env::var("BUZZ_UDS_PATH")
             .ok()
@@ -1028,6 +1126,8 @@ impl Config {
             relay_private_key,
             discovery,
             nip17_gateway,
+            #[cfg(feature = "fips")]
+            fips,
             uds_path,
             health_port,
             metrics_port,
@@ -1213,6 +1313,53 @@ mod tests {
             Err(ConfigError::InvalidValue(message)) if message.contains("BUZZ_NIP17_GATEWAY_PRIVATE_KEY")
         ));
         assert_eq!(gateway.relays, vec!["wss://relay.example/"]);
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_requires_a_stable_identity_relays_and_stun_servers() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let names = [
+            "BUZZ_FIPS_ENABLED",
+            "BUZZ_FIPS_PRIVATE_KEY",
+            "BUZZ_FIPS_NOSTR_RELAYS",
+            "BUZZ_FIPS_STUN_SERVERS",
+        ];
+        let previous: Vec<_> = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+
+        std::env::set_var("BUZZ_FIPS_ENABLED", "true");
+        std::env::remove_var("BUZZ_FIPS_PRIVATE_KEY");
+        std::env::set_var("BUZZ_FIPS_NOSTR_RELAYS", "wss://relay.example");
+        std::env::set_var("BUZZ_FIPS_STUN_SERVERS", "stun:stun.example:3478");
+        let missing_key = fips_config_from_env();
+
+        std::env::set_var(
+            "BUZZ_FIPS_PRIVATE_KEY",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        );
+        std::env::set_var(
+            "BUZZ_FIPS_NOSTR_RELAYS",
+            "wss://relay.example,wss://relay.example",
+        );
+        let config = fips_config_from_env()
+            .expect("FIPS config")
+            .expect("enabled");
+
+        for (name, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+        assert!(
+            matches!(missing_key, Err(ConfigError::InvalidValue(message)) if message.contains("BUZZ_FIPS_PRIVATE_KEY"))
+        );
+        assert_eq!(config.nostr_relays, vec!["wss://relay.example/"]);
+        assert_eq!(config.stun_servers, vec!["stun:stun.example:3478"]);
     }
 
     #[test]

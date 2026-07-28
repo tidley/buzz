@@ -80,9 +80,11 @@ metrics-exporter-prometheus = { workspace = true }
 metrics-util    = { workspace = true }
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 async-compression = { version = "0.4.42", features = ["tokio", "gzip"] }
+fips = { git = "https://github.com/tidley/fips.git", rev = "09e209f", default-features = false, features = ["nostr-discovery"], optional = true }
 
 [features]
 dev = ["buzz-auth/dev"]
+fips = ["dep:fips"]
 
 [dev-dependencies]
 mesh-llm-sdk = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.73.1", package = "mesh-llm-sdk", default-features = false, features = ["client", "serving"] }

@@ -17,6 +17,12 @@ export type Community = {
    * `REPOS` directory inside the nest.
    */
   reposDir?: string;
+  /** Direct WebSocket is the default. NIP-17 is opt-in per community. */
+  relayTransport?: "direct" | "nip17";
+  /** Expected author of encrypted gateway responses when using NIP-17. */
+  nip17GatewayPubkey?: string;
+  /** Public relays that carry NIP-17 gift wraps. */
+  nip17PublicRelayUrls?: string[];
   /**
    * @deprecated Never read. Kept on the type so old localStorage entries
    * deserialise without errors. New entries never set this field, and

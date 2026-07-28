@@ -193,6 +193,7 @@ export function useCommunityInit(
       }
       hasInitializedRef.current = true;
       appliedRelayUrlRef.current = activeCommunity.relayUrl;
+      relayClient.setTransportConfig(activeCommunity);
 
       // Apply community config to the Tauri backend.
       //

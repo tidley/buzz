@@ -1,6 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
+use nostr::{
+    nips::nip59::extract_rumor, Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, Tag,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::Channel, plugin::TauriPlugin, Manager, Runtime};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -30,6 +33,18 @@ enum WebSocketMessage {
     Ping(Vec<u8>),
     Pong(Vec<u8>),
     Close(Option<CloseFramePayload>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "transport", rename_all = "lowercase")]
+enum SocketConfig {
+    Direct,
+    Nip17 {
+        #[serde(rename = "gatewayPubkey")]
+        gateway_pubkey: String,
+        #[serde(rename = "publicRelayUrls")]
+        public_relay_urls: Vec<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,11 +190,236 @@ async fn open_connection(
 #[tauri::command]
 async fn connect(
     manager: tauri::State<'_, WebSocketManager>,
+    state: tauri::State<'_, crate::app_state::AppState>,
     url: String,
     on_message: Channel<serde_json::Value>,
-    _config: Option<serde_json::Value>,
+    config: Option<SocketConfig>,
 ) -> Result<Id, String> {
-    open_connection(manager.inner(), &url, on_message).await
+    match config.unwrap_or(SocketConfig::Direct) {
+        SocketConfig::Direct => open_connection(manager.inner(), &url, on_message).await,
+        SocketConfig::Nip17 {
+            gateway_pubkey,
+            public_relay_urls,
+        } => {
+            let keys = state
+                .keys
+                .lock()
+                .map_err(|error| error.to_string())?
+                .clone();
+            open_nip17_connection(
+                manager.inner(),
+                keys,
+                gateway_pubkey,
+                public_relay_urls,
+                on_message,
+            )
+            .await
+        }
+    }
+}
+
+async fn open_nip17_connection(
+    manager: &WebSocketManager,
+    keys: Keys,
+    gateway_pubkey: String,
+    public_relay_urls: Vec<String>,
+    on_message: Channel<serde_json::Value>,
+) -> Result<Id, String> {
+    let gateway = PublicKey::parse(&gateway_pubkey)
+        .map_err(|_| "NIP-17 gateway pubkey must be 64 hexadecimal characters".to_string())?;
+    if public_relay_urls.is_empty() {
+        return Err("NIP-17 requires at least one public relay".to_string());
+    }
+    if public_relay_urls.iter().any(|url| {
+        !matches!(url::Url::parse(url), Ok(parsed) if matches!(parsed.scheme(), "ws" | "wss") && parsed.host().is_some())
+    }) {
+        return Err("NIP-17 public relays must use ws:// or wss:// URLs".to_string());
+    }
+
+    let connect_cancel = manager.connect_cancel.lock().await.clone();
+    let mut sockets = Vec::new();
+    for url in public_relay_urls {
+        let result = tokio::select! {
+            _ = connect_cancel.cancelled() => return Err("WebSocket connection cancelled".to_string()),
+            result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&url)) => result,
+        };
+        if let Ok(Ok((socket, _))) = result {
+            sockets.push(socket);
+        }
+    }
+    if sockets.is_empty() {
+        return Err("Unable to connect to any configured NIP-17 public relay".to_string());
+    }
+
+    let current_connect_cancel = manager.connect_cancel.lock().await;
+    if connect_cancel.is_cancelled() {
+        return Err("WebSocket connection cancelled".to_string());
+    }
+    let id = loop {
+        let candidate = uuid::Uuid::new_v4().as_u128() as u32;
+        if !manager.connections.lock().await.contains_key(&candidate) {
+            break candidate;
+        }
+    };
+    let (sender, receiver) = mpsc::channel(SEND_QUEUE_CAPACITY);
+    let cancel = CancellationToken::new();
+    let handle = Arc::new(ConnectionHandle {
+        sender,
+        cancel: cancel.clone(),
+        task: Mutex::new(None),
+    });
+    let mut task_slot = handle.task.lock().await;
+    manager.connections.lock().await.insert(id, handle.clone());
+    let task = tauri::async_runtime::spawn(run_nip17_connection(
+        id,
+        sockets,
+        receiver,
+        cancel,
+        on_message,
+        manager.clone(),
+        keys,
+        gateway,
+    ));
+    *task_slot = Some(task);
+    drop(task_slot);
+    drop(current_connect_cancel);
+    Ok(id)
+}
+
+async fn run_nip17_connection(
+    id: Id,
+    sockets: Vec<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+    mut receiver: mpsc::Receiver<SendRequest>,
+    cancel: CancellationToken,
+    on_message: Channel<serde_json::Value>,
+    manager: WebSocketManager,
+    keys: Keys,
+    gateway: PublicKey,
+) {
+    let (incoming_tx, mut incoming_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
+    let mut relay_senders = Vec::new();
+    for socket in sockets {
+        let (mut writer, mut reader) = socket.split();
+        let (relay_tx, mut relay_rx) = mpsc::channel::<String>(SEND_QUEUE_CAPACITY);
+        relay_senders.push(relay_tx);
+        let inbound = incoming_tx.clone();
+        let child_cancel = cancel.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = child_cancel.cancelled() => break,
+                    message = relay_rx.recv() => match message {
+                        Some(message) => if writer.send(Message::Text(message.into())).await.is_err() { break },
+                        None => break,
+                    },
+                    message = reader.next() => match message {
+                        Some(Ok(Message::Text(message))) => { let _ = inbound.send(message.to_string()).await; }
+                        Some(Ok(_)) => {}
+                        _ => break,
+                    },
+                }
+            }
+        });
+    }
+    drop(incoming_tx);
+    let subscription = format!("buzz-nip17-{id}");
+    let request = serde_json::json!(["REQ", subscription, {"kinds": [1059], "#p": [keys.public_key().to_hex()]}]).to_string();
+    for sender in &relay_senders {
+        let _ = sender.send(request.clone()).await;
+    }
+    // A store-and-forward gateway has no connection until it receives a relay
+    // frame. Send a harmless CLOSE to prompt its initial NIP-42 challenge.
+    if let Ok(event) =
+        wrap_nip17_frame(&keys, &gateway, "[\"CLOSE\",\"__buzz_nip17_bootstrap\"]").await
+    {
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&event) {
+            let bootstrap = serde_json::json!(["EVENT", event]).to_string();
+            for sender in &relay_senders {
+                let _ = sender.send(bootstrap.clone()).await;
+            }
+        }
+    }
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            request = receiver.recv() => {
+                let Some(request) = request else { break };
+                let result = match request.message {
+                    Message::Text(frame) => wrap_nip17_frame(&keys, &gateway, frame.as_str()).await,
+                    _ => Err("NIP-17 relay transport only supports text frames".to_string()),
+                };
+                match result {
+                    Ok(frame) => {
+                        let result = serde_json::from_str::<serde_json::Value>(&frame)
+                            .map_err(|error| error.to_string())
+                            .and_then(|event| {
+                                Ok(serde_json::json!(["EVENT", event]).to_string())
+                            });
+                        match result {
+                            Ok(delivery) => {
+                                let mut sent = false;
+                                for sender in &relay_senders { if sender.send(delivery.clone()).await.is_ok() { sent = true; } }
+                                let _ = request.result.send(if sent { Ok(()) } else { Err("NIP-17 public relays are disconnected".to_string()) });
+                            }
+                            Err(error) => { let _ = request.result.send(Err(error)); }
+                        }
+                    }
+                    Err(error) => { let _ = request.result.send(Err(error)); }
+                }
+            }
+            Some(frame) = incoming_rx.recv() => {
+                if let Some(frame) = unwrap_nip17_frame(&keys, &gateway, &frame).await {
+                    if let Ok(value) = serde_json::to_value(OutboundMessage::Text(frame)) { let _ = on_message.send(value); }
+                }
+            }
+        }
+    }
+    manager.remove(id).await;
+}
+
+async fn wrap_nip17_frame(keys: &Keys, gateway: &PublicKey, frame: &str) -> Result<String, String> {
+    let tag = Tag::parse(vec!["p", &gateway.to_hex()]).map_err(|error| error.to_string())?;
+    let rumor = EventBuilder::new(Kind::from(14_u16), frame)
+        .tags([tag])
+        .build(keys.public_key());
+    EventBuilder::gift_wrap(keys, gateway, rumor, [])
+        .await
+        .map_err(|error| error.to_string())
+        .map(|event| event.as_json())
+}
+
+async fn unwrap_nip17_frame(keys: &Keys, gateway: &PublicKey, frame: &str) -> Option<String> {
+    let message: serde_json::Value = serde_json::from_str(frame).ok()?;
+    let event: Event = serde_json::from_value(message.get(2)?.clone()).ok()?;
+    let gift: serde_json::Value = serde_json::to_value(&event).ok()?;
+    if event.kind != Kind::GiftWrap || !has_recipient(&gift, &keys.public_key().to_hex()) {
+        return None;
+    }
+    let rumor = extract_rumor(keys, &event).await.ok()?;
+    if rumor.sender != *gateway || rumor.rumor.kind != Kind::from(14_u16) {
+        return None;
+    }
+    let rumor_value = serde_json::to_value(&rumor.rumor).ok()?;
+    has_recipient(&rumor_value, &keys.public_key().to_hex()).then_some(rumor.rumor.content)
+}
+
+fn has_recipient(event: &serde_json::Value, recipient: &str) -> bool {
+    event["tags"].as_array().is_some_and(|tags| {
+        tags.iter().any(|tag| {
+            tag.as_array().is_some_and(|tag| {
+                tag.len() >= 2
+                    && tag[0] == "p"
+                    && tag[1]
+                        .as_str()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(recipient))
+            })
+        })
+    })
 }
 
 async fn send_message(
@@ -335,6 +575,60 @@ mod tests {
 
     fn silent_channel() -> Channel<serde_json::Value> {
         Channel::new(|_: InvokeResponseBody| Ok(()))
+    }
+
+    #[tokio::test]
+    async fn nip17_only_accepts_frames_wrapped_by_the_configured_gateway() {
+        let recipient = Keys::generate();
+        let gateway = Keys::generate();
+        let attacker = Keys::generate();
+        let recipient_tag = Tag::parse(vec!["p", &recipient.public_key().to_hex()]).unwrap();
+
+        let response = EventBuilder::new(Kind::from(14_u16), "[\"NOTICE\",\"gateway\"]")
+            .tags([recipient_tag.clone()])
+            .build(gateway.public_key());
+        let gateway_wrap = EventBuilder::gift_wrap(&gateway, &recipient.public_key(), response, [])
+            .await
+            .unwrap();
+        let attacker_response = EventBuilder::new(Kind::from(14_u16), "[\"NOTICE\",\"attacker\"]")
+            .tags([recipient_tag])
+            .build(attacker.public_key());
+        let attacker_wrap =
+            EventBuilder::gift_wrap(&attacker, &recipient.public_key(), attacker_response, [])
+                .await
+                .unwrap();
+
+        let gateway_frame = serde_json::json!(["EVENT", "gift-wraps", gateway_wrap]).to_string();
+        let attacker_frame = serde_json::json!(["EVENT", "gift-wraps", attacker_wrap]).to_string();
+        assert_eq!(
+            unwrap_nip17_frame(&recipient, &gateway.public_key(), &gateway_frame).await,
+            Some("[\"NOTICE\",\"gateway\"]".to_string())
+        );
+        assert_eq!(
+            unwrap_nip17_frame(&recipient, &gateway.public_key(), &attacker_frame).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn nip17_wraps_outbound_relay_frames_for_the_gateway() {
+        let client = Keys::generate();
+        let gateway = Keys::generate();
+
+        let wrapped = wrap_nip17_frame(
+            &client,
+            &gateway.public_key(),
+            "[\"REQ\",\"sub\",{\"kinds\":[9]}]",
+        )
+        .await
+        .unwrap();
+        let event = Event::from_json(wrapped).unwrap();
+        let rumor = extract_rumor(&gateway, &event).await.unwrap();
+
+        assert_eq!(event.kind, Kind::GiftWrap);
+        assert_eq!(rumor.sender, client.public_key());
+        assert_eq!(rumor.rumor.kind, Kind::from(14_u16));
+        assert_eq!(rumor.rumor.content, "[\"REQ\",\"sub\",{\"kinds\":[9]}]");
     }
 
     #[tokio::test]

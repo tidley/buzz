@@ -41,7 +41,17 @@ export function resolveCommunityUpdateResult(
   activeId: string | null,
   id: string,
   updates: Partial<
-    Pick<Community, "name" | "relayUrl" | "token" | "pubkey" | "reposDir">
+    Pick<
+      Community,
+      | "name"
+      | "relayUrl"
+      | "token"
+      | "pubkey"
+      | "reposDir"
+      | "relayTransport"
+      | "nip17GatewayPubkey"
+      | "nip17PublicRelayUrls"
+    >
   >,
 ): UpdateCommunityResult {
   const current = communities.find((w) => w.id === id);
@@ -60,7 +70,14 @@ export function resolveCommunityUpdateResult(
     (updates.relayUrl !== undefined && updates.relayUrl !== current.relayUrl) ||
     (updates.token !== undefined && updates.token !== current.token) ||
     (updates.pubkey !== undefined && updates.pubkey !== current.pubkey) ||
-    (updates.reposDir !== undefined && updates.reposDir !== current.reposDir);
+    (updates.reposDir !== undefined && updates.reposDir !== current.reposDir) ||
+    (updates.relayTransport !== undefined &&
+      updates.relayTransport !== current.relayTransport) ||
+    (updates.nip17GatewayPubkey !== undefined &&
+      updates.nip17GatewayPubkey !== current.nip17GatewayPubkey) ||
+    (updates.nip17PublicRelayUrls !== undefined &&
+      JSON.stringify(updates.nip17PublicRelayUrls) !==
+        JSON.stringify(current.nip17PublicRelayUrls));
 
   if (!hasChange) return { kind: "unchanged" };
 
@@ -70,6 +87,13 @@ export function resolveCommunityUpdateResult(
     ((updates.relayUrl !== undefined &&
       updates.relayUrl !== current.relayUrl) ||
       (updates.token !== undefined && updates.token !== current.token) ||
+      (updates.relayTransport !== undefined &&
+        updates.relayTransport !== current.relayTransport) ||
+      (updates.nip17GatewayPubkey !== undefined &&
+        updates.nip17GatewayPubkey !== current.nip17GatewayPubkey) ||
+      (updates.nip17PublicRelayUrls !== undefined &&
+        JSON.stringify(updates.nip17PublicRelayUrls) !==
+          JSON.stringify(current.nip17PublicRelayUrls)) ||
       (updates.reposDir !== undefined &&
         updates.reposDir !== current.reposDir));
 
@@ -127,7 +151,17 @@ export type UseCommunitiesReturn = {
   updateCommunity: (
     id: string,
     updates: Partial<
-      Pick<Community, "name" | "relayUrl" | "token" | "pubkey" | "reposDir">
+      Pick<
+        Community,
+        | "name"
+        | "relayUrl"
+        | "token"
+        | "pubkey"
+        | "reposDir"
+        | "relayTransport"
+        | "nip17GatewayPubkey"
+        | "nip17PublicRelayUrls"
+      >
     >,
   ) => UpdateCommunityResult;
   /** Persist a new display order for the rail. IDs not in orderedIds keep their relative position at the end. */
