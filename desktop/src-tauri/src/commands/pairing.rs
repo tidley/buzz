@@ -106,13 +106,16 @@ pub async fn start_pairing(
     let ws_url = relay_ws_url_with_override(&state);
     let http_url = relay_api_base_url_with_override(&state);
 
-    // NIP-43 relays gate connections on membership, so an unpaired peer can't
-    // reach the main relay yet — it must go through the /pair sidecar. Open
-    // relays (no NIP-43) accept the peer directly. We key off the relay's
-    // own NIP-11 declaration of NIP-43 support rather than `auth_required`,
-    // which is also true for plain NIP-42 / NIP-OA relays where the main
-    // relay is reachable.
-    let pairing_relay_url = resolve_pairing_relay_url(&ws_url, probe_pairing_relay(&ws_url).await)?;
+    let pairing_relay_url = if transport.relay_transport == "nip17" {
+        // The private relay is intentionally unreachable from off-network
+        // devices. Pair through the same public relays that carry NIP-17
+        // frames after the SAS-verified credential transfer completes.
+        nip17_pairing_relay_url(&transport)?
+    } else {
+        // NIP-43 relays gate connections on membership, so an unpaired peer
+        // must use the relay's pairing sidecar when it is configured.
+        resolve_pairing_relay_url(&ws_url, probe_pairing_relay(&ws_url).await)?
+    };
 
     let (session, qr_payload) = PairingSession::new_source(pairing_relay_url.clone());
     let qr_uri = encode_qr(&qr_payload);
@@ -540,6 +543,20 @@ fn resolve_pairing_relay_url(
     }
 }
 
+fn nip17_pairing_relay_url(transport: &PairingTransport) -> Result<String, String> {
+    let relay = transport
+        .nip17_public_relay_urls
+        .as_ref()
+        .and_then(|relays| relays.first())
+        .ok_or_else(|| "NIP-17 pairing requires at least one public relay".to_string())?;
+    let url =
+        url::Url::parse(relay).map_err(|error| format!("invalid NIP-17 public relay: {error}"))?;
+    if !matches!(url.scheme(), "ws" | "wss") || url.host_str().is_none() {
+        return Err("NIP-17 pairing requires a ws:// or wss:// public relay".to_string());
+    }
+    Ok(relay.clone())
+}
+
 fn pairing_relay_from_nip11(json: &serde_json::Value) -> PairingRelay {
     if let Some(value) = json
         .get("pairing_relay_url")
@@ -638,7 +655,8 @@ mod pairing_generation_tests {
 #[cfg(test)]
 mod pairing_relay_tests {
     use super::{
-        pairing_relay_from_nip11, probe_pairing_relay, resolve_pairing_relay_url, PairingRelay,
+        nip17_pairing_relay_url, pairing_relay_from_nip11, probe_pairing_relay,
+        resolve_pairing_relay_url, PairingRelay, PairingTransport,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -686,6 +704,23 @@ mod pairing_relay_tests {
         assert_eq!(
             pairing_relay_from_nip11(&document),
             PairingRelay::Configured("wss://pairing.buzz.xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn nip17_pairing_uses_the_first_public_relay() {
+        let transport = PairingTransport {
+            relay_transport: "nip17".to_string(),
+            nip17_gateway_pubkey: Some("gateway".to_string()),
+            nip17_public_relay_urls: Some(vec![
+                "wss://pairing.example".to_string(),
+                "wss://backup.example".to_string(),
+            ]),
+        };
+
+        assert_eq!(
+            nip17_pairing_relay_url(&transport).expect("public relay"),
+            "wss://pairing.example"
         );
     }
 
