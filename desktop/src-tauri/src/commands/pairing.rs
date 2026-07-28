@@ -65,7 +65,7 @@ impl PairingHandle {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PairingTransport {
+pub(crate) struct PairingTransport {
     relay_transport: String,
     nip17_gateway_pubkey: Option<String>,
     nip17_public_relay_urls: Option<Vec<String>>,
