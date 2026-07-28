@@ -407,6 +407,18 @@ admin-check: fmt-check
 relay-release: _ensure-migrations
     cargo run -p buzz-relay --release
 
+# Start the relay with its opt-in FIPS QUIC responder. NIP-17 is also enabled
+# when its environment variables are configured.
+relay-fips: bootstrap _ensure-migrations
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PATH="{{justfile_directory()}}/bin:$PATH"
+    cargo run -p buzz-relay --features fips
+
+# Release-mode equivalent of `relay-fips`.
+relay-fips-release: _ensure-migrations
+    cargo run -p buzz-relay --release --features fips
+
 
 # Run the desktop Tauri app in dev mode with a local relay (ports and identity derived from worktree)
 dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
