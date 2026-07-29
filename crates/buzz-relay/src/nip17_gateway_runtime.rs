@@ -259,7 +259,10 @@ async fn run_session(
     let session_id = first.request.session_id.clone();
     let mut seen = HashSet::new();
     let mut seen_order = VecDeque::new();
-    let mut relay_url = first.relay_url.clone();
+    // Gift wraps are fanned out to every public relay, but those relays do not
+    // preserve a common ordering. Pin the virtual connection to the first path
+    // so NIP-42's challenge and AUTH frames retain WebSocket ordering.
+    let relay_url = first.relay_url.clone();
     let mut connection = match VirtualConnection::open_with_auth_relay_url(
         state,
         SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -284,10 +287,10 @@ async fn run_session(
                         warn!("NIP-17 gateway session sender mismatch");
                         continue;
                     }
-                    let request_relay = request.relay_url.clone();
-                    if dispatch_request(&mut connection, request, &mut seen, &mut seen_order).await {
-                        relay_url = request_relay;
+                    if request.relay_url != relay_url {
+                        continue;
                     }
+                    dispatch_request(&mut connection, request, &mut seen, &mut seen_order).await;
                 }
                 None => break,
             },
