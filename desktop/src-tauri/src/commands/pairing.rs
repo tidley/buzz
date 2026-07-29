@@ -18,6 +18,8 @@ use zeroize::Zeroizing;
 use crate::app_state::AppState;
 use crate::relay::{relay_api_base_url_with_override, relay_ws_url_with_override};
 
+const NIP17_RELAY_URL: &str = "https://nip17.buzz.invalid";
+
 #[derive(Serialize, Clone)]
 struct PairingSasPayload {
     sas: String,
@@ -105,6 +107,7 @@ pub async fn start_pairing(
 
     let ws_url = relay_ws_url_with_override(&state);
     let http_url = relay_api_base_url_with_override(&state);
+    let paired_relay_url = pairing_relay_identity(&transport, http_url);
 
     let pairing_relay_url = if transport.relay_transport == "nip17" {
         // The private relay is intentionally unreachable from off-network
@@ -121,7 +124,7 @@ pub async fn start_pairing(
     let qr_uri = encode_qr(&qr_payload);
 
     let payload_json = serde_json::json!({
-        "relayUrl": http_url,
+        "relayUrl": paired_relay_url,
         "pubkey": pubkey_hex,
         "nsec": nsec,
         "relayTransport": transport.relay_transport,
@@ -557,6 +560,14 @@ fn nip17_pairing_relay_url(transport: &PairingTransport) -> Result<String, Strin
     Ok(relay.clone())
 }
 
+fn pairing_relay_identity(transport: &PairingTransport, direct_relay_url: String) -> String {
+    if transport.relay_transport == "nip17" {
+        NIP17_RELAY_URL.to_string()
+    } else {
+        direct_relay_url
+    }
+}
+
 fn pairing_relay_from_nip11(json: &serde_json::Value) -> PairingRelay {
     if let Some(value) = json
         .get("pairing_relay_url")
@@ -655,8 +666,8 @@ mod pairing_generation_tests {
 #[cfg(test)]
 mod pairing_relay_tests {
     use super::{
-        nip17_pairing_relay_url, pairing_relay_from_nip11, probe_pairing_relay,
-        resolve_pairing_relay_url, PairingRelay, PairingTransport,
+        nip17_pairing_relay_url, pairing_relay_from_nip11, pairing_relay_identity,
+        probe_pairing_relay, resolve_pairing_relay_url, PairingRelay, PairingTransport,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -721,6 +732,20 @@ mod pairing_relay_tests {
         assert_eq!(
             nip17_pairing_relay_url(&transport).expect("public relay"),
             "wss://pairing.example"
+        );
+    }
+
+    #[test]
+    fn nip17_pairing_uses_the_virtual_relay_identity() {
+        let transport = PairingTransport {
+            relay_transport: "nip17".to_string(),
+            nip17_gateway_pubkey: Some("gateway".to_string()),
+            nip17_public_relay_urls: Some(vec!["wss://public.example".to_string()]),
+        };
+
+        assert_eq!(
+            pairing_relay_identity(&transport, "https://private.example".to_string()),
+            "https://nip17.buzz.invalid"
         );
     }
 
